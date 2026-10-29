@@ -3,6 +3,10 @@
 Agente de terminal em Go, com interface TUI (Bubble Tea), para conversar com
 modelos de IA e trabalhar nos arquivos do diretório atual.
 
+> Este repositório contém **apenas o agente de terminal**. Existe outro projeto
+> do mesmo autor chamado Amazzo, com outro propósito e outro código. O sufixo
+> `-tui` serve para diferenciar os dois.
+
 - Modelos **locais** via [Ollama](https://ollama.com), sem token nem conta.
 - Modelos **remotos** via Hugging Face, quando há um `HF_TOKEN` configurado.
 - Agentes especializados (`/agentes`), temas visuais (`/temas`) e servidor MCP.
