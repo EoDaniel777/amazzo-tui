@@ -1,0 +1,25 @@
+# segredos e dados locais: nunca versionar
+.env
+*.env
+!.env.example
+.amazzo/
+.claude/
+credentials.enc
+*.pem
+*.key
+
+# binarios e build
+/build/
+/amazzo
+*.test
+
+# modelos e datasets
+*.gguf
+*.safetensors
+*.jsonl
+*.zip
+
+# editor e sistema
+.idea/
+.vscode/
+.DS_Store

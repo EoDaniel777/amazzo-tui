@@ -1,0 +1,20 @@
+{
+  "colors": {
+    "primary": "#6A5ACD",
+    "secondary": "#87CEEB",
+    "accent": "#FF6B6B",
+    "text": "#F0F0F0",
+    "border": "#4A4A4A",
+    "success": "#50C878",
+    "warning": "#FFD700",
+    "error": "#DC143C"
+  },
+  "borders": {
+    "main": "rounded",
+    "content": "normal"
+  },
+  "padding": {
+    "content": [1, 2],
+    "button": [0, 1]
+  }
+}

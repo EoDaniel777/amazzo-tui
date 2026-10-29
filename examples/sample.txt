@@ -1,0 +1,11 @@
+Este é um documento de exemplo para demonstrar o funcionamento do Amazzo.
+
+O Amazzo é um agente de terminal que pode manipular documentos de várias formas:
+
+1. Leitura de documentos
+2. Processamento de texto
+3. Extração de informações
+4. Transformação de formatos
+5. Análise de conteúdo
+
+Com sua interface TUI moderna, ele oferece uma experiência elegante e profissional.
