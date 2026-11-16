@@ -99,7 +99,7 @@ func GetToken() (string, string, error) {
 	// arranque travava a abertura -- inclusive pelo lancador grafico, onde
 	// nao ha onde digitar. Quando um modelo remoto for escolhido sem token,
 	// o erro explica o que fazer; /key configura quando for o caso.
-	return "", "🏠 Modo local (Ollama). Use /key para habilitar os modelos remotos.", nil
+	return "", "Modelos locais (Ollama) e nuvem amazzo.tech. Use /key só para os modelos do Hugging Face.", nil
 }
 
 func init() {

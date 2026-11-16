@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -48,6 +49,9 @@ type OllamaChatRequest struct {
 	KeepAlive string        `json:"keep_alive,omitempty"`
 	Options   OllamaOptions `json:"options"`
 	Tools     []Tool        `json:"tools,omitempty"`
+	// Think liga ou desliga o raciocinio dos modelos que o suportam. Nil deixa
+	// o padrao do modelo.
+	Think *bool `json:"think,omitempty"`
 }
 
 // OllamaMessage e a mensagem devolvida pelo Ollama. Modelos com capability
@@ -141,7 +145,7 @@ func DefaultOllamaOptions() OllamaOptions {
 		// Precisa comportar system prompt + historico + resposta. Se o
 		// contexto estoura, o Ollama faz context shift: descarta metade da
 		// janela, joga fora o cache de prefixo e reprocessa tudo do zero.
-		NumCtx: envInt("AMAZZO_OLLAMA_NUM_CTX", 8192),
+		NumCtx: envInt("AMAZZO_OLLAMA_NUM_CTX", 12288),
 		// Sem teto de geracao (-1). Um limite so faz sentido quando se paga
 		// por token; aqui o modelo e local e cortar no meio so estraga a
 		// resposta -- modelos com raciocinio gastam centenas de tokens
@@ -208,6 +212,16 @@ func CallOllama(model string, messages []Message) (string, error) {
 // ~75s de tela parada, o primeiro token aparece assim que o prompt termina de
 // ser processado.
 func StreamOllama(ctx context.Context, model string, messages []Message, tools []Tool, onChunk func(text string, thinking bool)) (string, []ToolCall, OllamaStats, error) {
+	think := ThinkingEnabled()
+	full, calls, stats, err := streamOllama(ctx, model, messages, tools, onChunk, &think)
+	// Modelos sem a capacidade de raciocinio recusam o campo: tenta de novo sem ele.
+	if err != nil && strings.Contains(err.Error(), "think") {
+		return streamOllama(ctx, model, messages, tools, onChunk, nil)
+	}
+	return full, calls, stats, err
+}
+
+func streamOllama(ctx context.Context, model string, messages []Message, tools []Tool, onChunk func(text string, thinking bool), think *bool) (string, []ToolCall, OllamaStats, error) {
 	var stats OllamaStats
 	var toolCalls []ToolCall
 
@@ -218,6 +232,7 @@ func StreamOllama(ctx context.Context, model string, messages []Message, tools [
 		KeepAlive: OllamaKeepAlive(),
 		Options:   DefaultOllamaOptions(),
 		Tools:     tools,
+		Think:     think,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -320,4 +335,22 @@ func stripThinkTags(s string) string {
 	s = thinkTagRe.ReplaceAllString(s, "")
 	s = toolCallTagRe.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
+}
+
+var thinkingEnabled atomic.Bool
+
+func init() { thinkingEnabled.Store(os.Getenv("AMAZZO_THINK") == "1") }
+
+// ThinkingEnabled diz se o raciocinio dos modelos esta ligado. Desligado por
+// padrao: modelos de 4B gastavam de 40s a 2min pensando antes de responder.
+func ThinkingEnabled() bool { return thinkingEnabled.Load() }
+
+// ToggleThinking inverte o raciocinio e devolve o novo estado.
+func ToggleThinking() bool {
+	for {
+		old := thinkingEnabled.Load()
+		if thinkingEnabled.CompareAndSwap(old, !old) {
+			return !old
+		}
+	}
 }

@@ -82,13 +82,18 @@ func (m *Model) callAPIStream(input string) tea.Cmd {
 				m.cancelFunc = nil
 			}()
 
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://router.huggingface.co/v1/chat/completions", strings.NewReader(string(requestBody)))
+			alvoURL, alvoToken, terr := m.remoteTarget(availableModels[modelIdx])
+			if terr != nil {
+				lastErr = terr
+				continue
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, alvoURL, strings.NewReader(string(requestBody)))
 			if err != nil {
 				lastErr = fmt.Errorf("erro ao criar requisição: %w", err)
 				continue
 			}
 
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", m.hfToken))
+			req.Header.Set("Authorization", "Bearer "+alvoToken)
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Accept", "text/event-stream")
 

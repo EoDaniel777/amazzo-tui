@@ -17,16 +17,15 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
-// O trilho substituiu as meias-caixas justamente porque elas desalinhavam.
-// Toda linha do bloco precisa começar com o trilho e caber na largura.
-func TestBlocoTemTrilhoEmTodasAsLinhas(t *testing.T) {
+// Nenhuma linha do bloco pode passar da largura nem ter prefixo de trilho.
+func TestBlocoCabeNaLargura(t *testing.T) {
 	corpo := "primeira linha\nsegunda linha um pouco mais longa para forçar a quebra do texto no limite"
 	out := renderAssistantEntry("lfm2.5:8b", "17 tok/s · 14s", corpo, 60)
 
 	for i, linha := range strings.Split(out, "\n") {
 		limpa := ansi.Strip(linha)
-		if !strings.HasPrefix(limpa, railGlyph) {
-			t.Errorf("linha %d sem trilho: %q", i, limpa)
+		if strings.HasPrefix(limpa, railGlyph) {
+			t.Errorf("linha %d não deveria ter trilho: %q", i, limpa)
 		}
 		if w := ansi.StringWidth(limpa); w > 60 {
 			t.Errorf("linha %d com largura %d > 60: %q", i, w, limpa)

@@ -77,6 +77,12 @@ type Dependencies struct {
 	// Modo Ultra Visual
 	IsUltraMode     func() bool
 	ToggleUltraMode func() bool
+
+	// Layout (explorador e painel)
+	ToggleThinking func() bool
+	ToggleExplorer func() bool
+	TogglePanel    func() bool
+	SetFocusMode   func(bool)
 }
 
 // Manager gerencia comandos complexos.
@@ -104,6 +110,46 @@ func Handle(input string, deps Dependencies) bool {
 		deps.AddBlank()
 		return true
 
+	case "pensar", "think", "raciocinio":
+		if deps.ToggleThinking != nil {
+			if deps.ToggleThinking() {
+				deps.AddInfo("Raciocínio ligado: respostas melhores em tarefas difíceis, mas bem mais lentas.")
+			} else {
+				deps.AddInfo("Raciocínio desligado: respostas diretas e rápidas.")
+			}
+		}
+		deps.AddBlank()
+		return true
+
+	case "explorador", "explorer", "arquivos":
+		if deps.ToggleExplorer != nil {
+			if deps.ToggleExplorer() {
+				deps.AddInfo("📂 Explorador visível. ctrl+b ou /explorador para ocultar.")
+			} else {
+				deps.AddInfo("📂 Explorador oculto.")
+			}
+		}
+		deps.AddBlank()
+		return true
+
+	case "painel", "panel", "terminal":
+		if deps.TogglePanel != nil {
+			if deps.TogglePanel() {
+				deps.AddInfo("▤ Painel de saída visível. ctrl+g ou /painel para ocultar.")
+			} else {
+				deps.AddInfo("▤ Painel de saída oculto.")
+			}
+		}
+		deps.AddBlank()
+		return true
+
+	case "foco", "focus", "zen":
+		if deps.SetFocusMode != nil {
+			// "/foco" oculta tudo; "/foco off" mostra explorador e painel.
+			deps.SetFocusMode(!(len(parts) > 1 && (parts[1] == "off" || parts[1] == "nao")))
+		}
+		return true
+
 	case "ultra", "ultramode":
 		if deps.ToggleUltraMode != nil {
 			enabled := deps.ToggleUltraMode()
@@ -123,7 +169,7 @@ func Handle(input string, deps Dependencies) bool {
 		deps.AddBlank()
 		return true
 
-	case "agente", "agent", "modelo", "model":
+	case "agente", "agent", "modelo", "model", "modelos", "models":
 		return handleModelChange(parts, deps)
 
 	case "ollama", "local":
@@ -311,6 +357,10 @@ func showHelp(deps Dependencies) {
 		"│  🎨 Personalização:",
 		"│  /temas [nome]             - Lista ou troca o tema de cores",
 		"│  /ultra                    - ✨ Ativa MODO ULTRA VISUAL (extraordinário!)",
+		"│  /explorador (ctrl+b)      - Mostra/oculta o explorador de arquivos",
+		"│  /painel (ctrl+g)          - Mostra/oculta o painel de saída",
+		"│  /foco                     - Só o chat (/foco off mostra tudo)",
+		"│  /pensar                   - Liga/desliga o raciocínio do modelo (padrão: desligado)",
 		"│  /key ou /token            - 🔐 Atualiza token do Hugging Face",
 		"│",
 		"│  📊 Monitoramento:",
@@ -364,8 +414,8 @@ func handleModelChange(parts []string, deps Dependencies) bool {
 			deps.AddHelp(fmt.Sprintf("%s[%d] %s", prefix, i+1, model.DisplayName))
 		}
 		deps.AddHelp("│")
-		deps.AddHelp("│  Use: /agente <número> para trocar")
-		deps.AddHelp("│  Ex: /agente 1 para usar o primeiro modelo")
+		deps.AddHelp("│  Use: /modelo <número> para trocar")
+		deps.AddHelp("│  (modelo = a IA que responde; /agentes = personas especializadas)")
 		deps.AddHelp("└─")
 		deps.AddBlank()
 		return true
@@ -374,7 +424,7 @@ func handleModelChange(parts []string, deps Dependencies) bool {
 	index, err := strconv.Atoi(parts[1])
 	if err != nil || index < 1 || index > len(models) {
 		deps.AddError(fmt.Sprintf("┌─ Erro: número de modelo inválido (1-%d)", len(models)))
-		deps.AddError("│  Use /agente para ver os modelos disponíveis")
+		deps.AddError("│  Use /modelo para ver os modelos disponíveis")
 		deps.AddError("└─")
 		deps.AddBlank()
 		return true
@@ -398,21 +448,26 @@ func handleThemeChange(parts []string, deps Dependencies) bool {
 	if len(parts) == 1 {
 		deps.AddHelp("┌─ Temas disponíveis:")
 		current := deps.GetCurrentThemeKey()
-		for _, theme := range themes {
+		for i, theme := range themes {
 			prefix := "│    "
 			if theme.Key == current {
 				prefix = "│  ► "
 			}
-			deps.AddHelp(fmt.Sprintf("%s%s", prefix, theme.Name))
+			deps.AddHelp(fmt.Sprintf("%s[%d] %s  (%s)", prefix, i+1, theme.Name, theme.Key))
 		}
 		deps.AddHelp("│")
-		deps.AddHelp("│  Use: /temas <nome> para trocar")
+		deps.AddHelp("│  Use: /temas <número ou nome> para trocar")
+		deps.AddHelp("│  Dica: /ajuda abre o seletor com prévia ao vivo")
 		deps.AddHelp("└─")
 		deps.AddBlank()
 		return true
 	}
 
 	themeKey := strings.ToLower(parts[1])
+	// "/temas 3" escolhe pelo número da lista.
+	if n, err := strconv.Atoi(themeKey); err == nil && n >= 1 && n <= len(themes) {
+		themeKey = themes[n-1].Key
+	}
 	if err := deps.SetTheme(themeKey); err != nil {
 		deps.AddError(fmt.Sprintf("┌─ Erro: %v", err))
 		deps.AddError("└─")

@@ -84,6 +84,11 @@ const localSystemPrompt = "Você é o Amazzo, um assistente de programação que
 	"{\"tool\":\"web_fetch\",\"url\":\"https://...\"}\n" +
 	"{\"tool\":\"set_workspace\",\"path\":\"/caminho/do/projeto\"}\n" +
 	"\n" +
+	"EXECUTAR\n" +
+	"Pedido para rodar, executar ou iniciar um programa → use execute_command JÁ,\n" +
+	"sem explicar antes. Binário na pasta: \"./nome\". Projeto Go: \"go run ./cmd/nome\".\n" +
+	"Se o programa não termina sozinho (servidor, bot), ele segue em segundo plano.\n" +
+	"\n" +
 	"PASTA DE TRABALHO\n" +
 	"Você só enxerga dentro da pasta de trabalho atual. Se o usuário citar um\n" +
 	"projeto em outro caminho, ABRA a pasta primeiro com set_workspace e só\n" +
@@ -157,7 +162,7 @@ func (m *Model) localHistory() []agents.Message {
 	// ~850 tokens nesta maquina, 10% do num_ctx. Ignora-los fazia o corte do
 	// historico acontecer tarde, e o Ollama fazia context shift -- que joga
 	// fora o cache de prefixo e reprocessa tudo.
-	budget -= estimateTokens(textoDosSchemas())
+	budget -= estimateTokens(textoDosSchemas() + m.textoDosSchemasExternos())
 	budget -= budget / 5
 
 	if budget < 0 {
@@ -192,6 +197,7 @@ func (m *Model) callOllamaStream(model string) tea.Cmd {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancelFunc = cancel
+	tools := m.toolSchemas()
 
 	ch := make(chan tea.Msg, 64)
 	m.streamCh = ch
@@ -199,7 +205,7 @@ func (m *Model) callOllamaStream(model string) tea.Cmd {
 	go func() {
 		defer close(ch)
 		full, toolCalls, stats, err := agents.StreamOllama(ctx, model, messages,
-			agents.DefaultTools(), func(chunk string, thinking bool) {
+			tools, func(chunk string, thinking bool) {
 				select {
 				case ch <- ollamaChunkMsg{text: chunk, thinking: thinking}:
 				case <-ctx.Done():
@@ -238,11 +244,15 @@ func (m *Model) streamingPreview() string {
 		width = 24
 	}
 
+	if m.toolsRunning {
+		return m.toolsPreview(width)
+	}
+
 	// Já respondendo: o conteúdo real tem prioridade sobre o raciocínio.
 	if m.streamPartial != "" {
 		return entry{
 			rail:  colSignal,
-			label: "escrevendo",
+			label: m.spinner.View() + " escrevendo",
 			meta:  formatElapsed(time.Since(m.streamStart)),
 			body:  ultimasLinhas(m.streamPartial, width-2, 12),
 			width: width,
@@ -259,7 +269,7 @@ func (m *Model) streamingPreview() string {
 	// então dizer o que está acontecendo evita a sensação de travamento.
 	return entry{
 		rail:  colGraphite,
-		label: "lendo o pedido",
+		label: m.spinner.View() + " " + palavraDeEspera(m.streamStart, time.Now()),
 		meta:  formatElapsed(time.Since(m.streamStart)),
 		width: width,
 	}.render()

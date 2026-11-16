@@ -21,6 +21,7 @@ import (
 	"amazzo/filesystem"
 	"amazzo/logs"
 	"amazzo/mcp"
+	"amazzo/mcpclient"
 	"amazzo/permissions"
 	"amazzo/tasks"
 	"amazzo/themes"
@@ -83,7 +84,10 @@ var fallbackLocalModel = agents.ModelConfig{
 
 // availableModels e montada no arranque: modelos locais realmente instalados
 // no Ollama primeiro, depois os remotos.
-var availableModels = append([]agents.ModelConfig{fallbackLocalModel}, remoteModels...)
+var availableModels = composeModels([]agents.ModelConfig{fallbackLocalModel}, false)
+
+// hfEnabled liga os modelos do Hugging Face na lista (precisa de token).
+var hfEnabled bool
 
 // loadAvailableModels pergunta ao Ollama quais modelos existem nesta maquina.
 // Antes a lista era fixa em "gemma3", entao qualquer outro modelo baixado com
@@ -91,9 +95,9 @@ var availableModels = append([]agents.ModelConfig{fallbackLocalModel}, remoteMod
 func loadAvailableModels() {
 	local, err := agents.FetchOllamaModels()
 	if err != nil || len(local) == 0 {
-		return
+		local = []agents.ModelConfig{fallbackLocalModel}
 	}
-	availableModels = append(local, remoteModels...)
+	availableModels = composeModels(local, hfEnabled)
 }
 
 var commandSuggestions = []string{
@@ -118,10 +122,17 @@ var commandSuggestions = []string{
 	"/erro",
 	"/metricas",
 	"/metrics",
+	"/explorador",
+	"/painel",
+	"/foco",
+	"/pensar",
 }
 
 // Model agrega o estado principal do Bubble Tea.
 type Model struct {
+	ide      ideState
+	pal      palette
+	rerender map[int]rerenderItem
 	viewport viewport.Model
 	textarea textarea.Model
 	spinner  spinner.Model
@@ -134,11 +145,15 @@ type Model struct {
 	theme        themes.ThemeConfig
 
 	hfToken       string
+	cloud         cloudAccess
 	fsManager     *filesystem.Manager
 	logSaver      *logs.Saver
 	workspaceRoot string
 
 	mcpServer        *mcp.Server
+	mcpMgr           *mcpclient.Manager
+	mcpReloading     bool
+	pendingCmd       tea.Cmd
 	permManager      *permissions.Manager
 	awaitingApproval bool
 	pendingRequests  []mcp.Request
@@ -163,6 +178,11 @@ type Model struct {
 	splashStartTime  time.Time
 	tickCount        int // Contador de ticks para prevenir loops infinitos
 	firstMessageSent bool
+	toolsRunning     bool
+	toolsInterrupted bool
+	toolsStart       time.Time
+	toolsLabel       string
+	toolsCancel      context.CancelFunc
 	cancelFunc       context.CancelFunc // Para cancelar requisições em andamento com ESC
 
 	// Autocomplete de arquivos com @
@@ -256,6 +276,7 @@ func New(hfToken, workspace, tokenStatus string) (*Model, error) {
 	debug := os.Getenv("DEBUG") == "1"
 
 	// Descobre os modelos locais instalados no Ollama.
+	hfEnabled = strings.TrimSpace(hfToken) != ""
 	loadAvailableModels()
 
 	if debug {
@@ -384,6 +405,8 @@ func New(hfToken, workspace, tokenStatus string) (*Model, error) {
 	// Inicializa estilos modernos
 	modernStyles := NewModernStyles(isDarkTheme)
 
+	applyUIPalette(savedThemeName)
+
 	m := &Model{
 		textarea:                 ta,
 		viewport:                 vp,
@@ -394,6 +417,7 @@ func New(hfToken, workspace, tokenStatus string) (*Model, error) {
 		currentTheme:             savedThemeName,
 		theme:                    defaultTheme,
 		hfToken:                  hfToken,
+		cloud:                    loadCloudAccess(),
 		fsManager:                fsManager,
 		logSaver:                 saver,
 		workspaceRoot:            fsManager.Root(),
@@ -502,7 +526,7 @@ func (m *Model) setupCommandDeps() {
 			// Preserva o modelo selecionado pelo nome: a posicao dele na
 			// lista muda quando modelos novos entram.
 			atual := availableModels[m.currentModel].Name
-			availableModels = append(local, remoteModels...)
+			availableModels = composeModels(local, hfEnabled)
 
 			m.currentModel = 0
 			for i, cfg := range availableModels {
@@ -545,6 +569,10 @@ func (m *Model) setupCommandDeps() {
 			}
 			m.currentTheme = name
 			m.theme = theme
+			applyUIPalette(name)
+			m.glamourWidth = 0 // força refazer o estilo do markdown
+			m.setGlamourWidth(m.viewport.Width - 4)
+			m.rerenderHistory()
 			return nil
 		},
 		SaveTheme: func(name string) error {
@@ -623,6 +651,10 @@ func (m *Model) setupCommandDeps() {
 			m.ultraMode = !m.ultraMode
 			return m.ultraMode
 		},
+		ToggleThinking: agents.ToggleThinking,
+		ToggleExplorer: func() bool { return m.toggleExplorer() },
+		TogglePanel:    func() bool { return m.togglePanel() },
+		SetFocusMode:   func(f bool) { m.setFocusMode(f) },
 	}
 }
 
@@ -769,15 +801,16 @@ func (m *Model) showWelcomeTutorial() {
 	m.addMessage("")
 	m.addMessage(m.theme.InfoStyle.Render("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
 	m.addMessage("")
-	m.addMessage(m.theme.LogoStyle.Render("        👋 Olá! Sou o Amazzo, seu assistente de IA."))
+	m.addMessage(lipgloss.NewStyle().Foreground(colSignal).Bold(true).Render("Olá! Sou o Amazzo, seu assistente de código."))
 	m.addMessage("")
-	m.addMessage("  💬 Converse comigo naturalmente - faça perguntas, peça ajuda com código,")
-	m.addMessage("     ou solicite que eu crie arquivos e execute comandos.")
+	m.addMessage("Converse naturalmente: faça perguntas, peça ajuda com código ou")
+	m.addMessage("peça que eu crie arquivos e execute comandos.")
 	m.addMessage("")
-	m.addMessage(m.theme.HelpStyle.Render("  Dicas rápidas:"))
-	m.addMessage("     • Digite /ajuda para ver todos os comandos")
-	m.addMessage("     • Use @arquivo.txt para incluir conteúdo de arquivos")
-	m.addMessage("     • Ctrl+L para limpar a tela")
+	m.addMessage(lipgloss.NewStyle().Foreground(colGraphite).Render("Dicas"))
+	m.addMessage("  /ajuda        lista os comandos")
+	m.addMessage("  @arquivo      inclui o conteúdo de um arquivo")
+	m.addMessage("  ctrl+b        explorador · ctrl+g painel · /foco só o chat")
+	m.addMessage("  ctrl+l        limpa a tela")
 	m.addMessage("")
 	m.addMessage(m.theme.InfoStyle.Render("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"))
 	m.addMessage("")
@@ -920,6 +953,9 @@ func (m *Model) interceptKey(msg tea.KeyMsg) bool {
 		// Sem teto de tokens, o Esc é o freio: o modelo local pode escrever
 		// por minutos. O que ele já produziu é preservado — costuma ser o
 		// que interessa, e jogar fora obrigaria a começar do zero.
+		if m.interrompeFerramentas() {
+			return true
+		}
 		if m.loading && m.cancelFunc != nil {
 			m.cancelFunc()
 			m.loading = false
@@ -958,6 +994,12 @@ func (m *Model) interceptKey(msg tea.KeyMsg) bool {
 			return true
 		case "ctrl+0":
 			m.handleZoomReset()
+			return true
+		case "ctrl+b":
+			m.toggleExplorer()
+			return true
+		case "ctrl+g":
+			m.togglePanel()
 			return true
 		case "ctrl+t":
 			// Toggle visualização de tarefas
@@ -1208,9 +1250,14 @@ func (m *Model) completeFileSelection() bool {
 }
 
 func (m *Model) Init() tea.Cmd {
+	if m.mcpMgr == nil {
+		m.initMCP()
+	}
 	return tea.Batch(
+		m.reloadMCP(true),
 		textarea.Blink,
 		tickCmd(), // Inicia ticker para splash screen
+		clockCmd(),
 	)
 }
 
@@ -1221,6 +1268,15 @@ func tickCmd() tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	mod, cmd := m.update(msg)
+	if m.pendingCmd != nil {
+		cmd = tea.Batch(cmd, m.pendingCmd)
+		m.pendingCmd = nil
+	}
+	return mod, cmd
+}
+
+func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
 		tiCmd tea.Cmd
 		vpCmd tea.Cmd
@@ -1232,6 +1288,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
+
+	case shellDoneMsg:
+		m.finishShell(msg)
+		return m, nil
+
+	case toolsDoneMsg:
+		return m, m.finishTools(msg)
+
+	case mcpReloadedMsg:
+		m.onMCPReloaded(msg)
+		return m, nil
+
+	case clockTickMsg:
+		m.onClockTick(time.Time(msg))
+		// Como um "source ~/.bashrc": mexeu na configuração, vale já.
+		if m.mcpMgr != nil && !m.loading && !m.mcpReloading && m.mcpMgr.Changed() {
+			m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(true))
+		}
+		return m, clockCmd()
 
 	case tickMsg:
 		m.tickCount++
@@ -1280,6 +1355,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tickCount = 0
 			m.finishSplash()
 			return m, textarea.Blink
+		}
+
+		// Paleta de comandos: com ela aberta, ela recebe todas as teclas.
+		if m.pal.active {
+			return m, m.handlePaletteKey(msg)
+		}
+		if msg.Type == tea.KeyCtrlK || msg.String() == "f1" {
+			m.openPalette()
+			return m, nil
 		}
 
 		// Ctrl+R abre e fecha o raciocínio dos modelos que pensam.
@@ -1358,11 +1442,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(tiCmd, vpCmd)
 			}
 
+			input := strings.TrimSpace(m.textarea.Value())
+
+			// Comandos de barra funcionam sempre: com o modelo ocupado, com uma
+			// autorização pendente ou com a conversa rolada para cima.
+			if strings.HasPrefix(input, "/") && !strings.HasPrefix(input, "//") {
+				m.limpaCampoDeTexto()
+				m.commandHistory = append(m.commandHistory, input)
+				m.historyIndex = 0
+				if low := strings.ToLower(input); low == "/ajuda" || low == "/help" {
+					m.openPalette()
+					return m, tea.Batch(tiCmd, vpCmd)
+				} else if low == "/rodar" || low == "/run" {
+					m.openPalette()
+					m.enterSubmenu("rodar")
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+				if m.runSlash(input) {
+					return m, tea.Batch(tiCmd, vpCmd)
+				}
+				// Não é um comando conhecido: segue como texto normal.
+				m.textarea.SetValue(input)
+			}
+
+			// "!comando" roda direto na pasta do projeto, sem passar pelo modelo.
+			if strings.HasPrefix(input, "!") && len(input) > 1 && !m.awaitingApproval {
+				m.limpaCampoDeTexto()
+				m.commandHistory = append(m.commandHistory, input)
+				m.historyIndex = 0
+				return m, tea.Batch(tiCmd, vpCmd, m.startShell(strings.TrimSpace(input[1:])))
+			}
+
 			if m.loading {
 				return m, nil
 			}
-
-			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				return m, nil
 			}
@@ -1397,6 +1510,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.firstMessageSent = true
 			}
 
+			// Texto colado enorme come o contexto: manda começo e fim.
+			input, avisoPaste := limitPaste(input)
 			processedInput, err := m.processFileReferences(input)
 			if err != nil {
 				m.addMessage(renderNotice("✗", fmt.Sprintf("Não consegui ler o arquivo: %v", err), colAlarm))
@@ -1419,10 +1534,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				userMsg := m.ultimateStyles.RenderGlowingUserMessage(displayInput, m.viewport.Width)
 				m.addMessage(userMsg)
 			} else {
-				m.addMessage(renderUserEntry(displayInput, m.viewport.Width))
+				m.addRerenderable(func() string { return renderUserEntry(displayInput, m.viewport.Width) })
 			}
 			m.addMessage("")
 
+			if avisoPaste != "" {
+				m.addMessage(renderNotice("!", avisoPaste, colAct))
+				m.addMessage("")
+			}
+
+			m.startTask()
 			m.loading = true
 
 			return m, tea.Batch(
@@ -1450,6 +1571,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent("")
 			m.viewport.GotoTop()
 			m.conversationHistory = m.conversationHistory[:1] // Mantém apenas system prompt
+			m.resetClock()
 			m.toolRuns = 0
 			m.inputTokens = 0
 			m.outputTokens = 0
@@ -1468,44 +1590,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tiCmd, vpCmd)
 
 	case tea.WindowSizeMsg:
+		// m.width/m.height descrevem a área do chat; o terminal inteiro fica
+		// em ide.termW/termH (ver layout_ide.go).
+		m.ide.termW = msg.Width
+		m.ide.termH = msg.Height
 		m.width = msg.Width
 		m.height = msg.Height
-
-		// Layout compacto (Tododo/Gonzo style) - margem mínima
-		headerHeight := 2 // Status bar apenas (reduzido de 3)
-		if m.showBanner {
-			headerHeight = 14
-		}
-		footerHeight := 3 // Input + shortcuts compactos (reduzido de 4)
-
-		// Usa largura máxima (margem mínima de 2)
-		newViewportWidth := msg.Width - 2
-		if newViewportWidth < 60 {
-			newViewportWidth = 60
-		}
-
-		// Maximiza altura do viewport (mais espaço)
-		newViewportHeight := msg.Height - headerHeight - footerHeight
-		if newViewportHeight < 10 {
-			newViewportHeight = 10
-		}
-
-		m.viewport.Width = newViewportWidth
-		m.viewport.Height = newViewportHeight
-		// -6 = borda (2) + padding (2) da moldura + margem (2). Precisa casar
-		// com o espaco interno de renderInputFrame: se sobrar, o lipgloss
-		// quebra o texto de novo e a primeira linha some.
-		//
-		// Fica aqui, e nao no View: mexer no textarea durante a renderizacao
-		// faz o quadro discordar do estado que ele mesmo acabou de mudar, e a
-		// linha de cima era sobrescrita no quadro seguinte.
-		m.textarea.SetWidth(m.larguraDoCampo())
-		m.adjustTextareaHeight()
-
-		// O markdown precisa ser reflowado na largura nova: com largura fixa
-		// o texto estourava em terminais estreitos e deixava faixa morta nos
-		// largos. -4 desconta a margem que o Glamour ja aplica.
-		m.setGlamourWidth(newViewportWidth - 4)
+		m.applyLayout()
 
 	case ollamaChunkMsg:
 		// Acumula o texto parcial e volta a esperar o proximo pedaco.
@@ -1618,7 +1709,7 @@ func (m *Model) setGlamourWidth(width int) {
 	// consome a resposta, o termenv fica esperando e a TUI congela no
 	// primeiro quadro. O tema ja diz se o fundo e claro ou escuro.
 	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle(m.glamourStyleName()),
+		glamour.WithStyles(glamourStyleFromPalette()),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
@@ -1892,14 +1983,9 @@ func (m *Model) callAPI(input string) tea.Cmd {
 		return m.callOllamaStream(cfg.Endpoint)
 	}
 
-	// Modelos do Hugging Face exigem token; sem ele o erro da API e opaco.
-	if strings.TrimSpace(m.hfToken) == "" {
-		nome := availableModels[m.currentModel].DisplayName
-		return func() tea.Msg {
-			return apiResponseMsg{err: fmt.Errorf(
-				"%s é um modelo remoto e precisa de um token do Hugging Face.\n"+
-					"Use /key para configurar, ou /modelo para escolher um modelo local (🏠)", nome)}
-		}
+	// Modelo remoto sem chave: o erro da API seria opaco, então avisamos antes.
+	if _, _, err := m.remoteTarget(availableModels[m.currentModel]); err != nil {
+		return func() tea.Msg { return apiResponseMsg{err: err} }
 	}
 
 	return func() tea.Msg {
@@ -1970,13 +2056,17 @@ func (m *Model) callAPI(input string) tea.Cmd {
 			m.cancelFunc = nil
 		}()
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://router.huggingface.co/v1/chat/completions", strings.NewReader(string(requestBody)))
+		alvoURL, alvoToken, err := m.remoteTarget(modelConfig)
+		if err != nil {
+			return apiResponseMsg{err: err}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, alvoURL, strings.NewReader(string(requestBody)))
 		if err != nil {
 			m.metrics.RecordRequest(time.Since(startTime), false, 0)
 			return apiResponseMsg{err: fmt.Errorf("erro ao criar requisição: %w", err)}
 		}
 
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", m.hfToken))
+		req.Header.Set("Authorization", "Bearer "+alvoToken)
 		req.Header.Set("Content-Type", "application/json")
 
 		// Cliente HTTP otimizado - FORÇA HTTP/1.1 (HTTP/2 causa timeouts)
@@ -2160,8 +2250,10 @@ func (m *Model) handleAIResponse(response string) tea.Cmd {
 			m.lastThinking = ""
 		}
 
-		m.addMessage(renderAssistantEntry(modelName, m.responseMeta(),
-			renderedResponse, m.viewport.Width))
+		meta := m.responseMeta()
+		m.addRerenderable(func() string {
+			return renderAssistantEntry(modelName, meta, m.renderMarkdown(response), m.viewport.Width)
+		})
 	}
 	m.addMessage("")
 
@@ -2185,24 +2277,15 @@ func (m *Model) handleAIResponse(response string) tea.Cmd {
 		// ve o resultado da acao sem ver qual acao foi pedida.
 		m.mostraChamadasNativas(chamadasNativas)
 		m.toolCallsTotal += len(requests)
-		resultados, pending := m.executeToolRequests(requests)
+		cmd, pending := m.executeToolsAsync(requests)
 		if pending {
 			return nil
 		}
-		if len(resultados) == 0 {
+		if cmd == nil {
 			m.toolRuns = 0
 			return nil
 		}
-		m.loading = true
-
-		// Feedback de progresso
-		progressMsg := fmt.Sprintf("🔁 Executando ferramentas (%d/%d ciclos)...", m.toolRuns, 15)
-		if m.toolRuns >= 12 {
-			progressMsg += " ⚠️ Aproximando do limite"
-		}
-		m.addMessage(m.theme.InfoStyle.Render(progressMsg))
-
-		return tea.Batch(m.spinner.Tick, m.continuaAposFerramentas(resultados))
+		return cmd
 	}
 
 	// 🚨 STOP HOOK: Verifica se há tarefas pendentes antes de parar
@@ -2267,7 +2350,7 @@ func (m *Model) mostraChamadasNativas(chamadas []agents.ToolCall) {
 		if err != nil {
 			continue
 		}
-		m.addMessage(formatToolCallClean(string(bruto)))
+		m.addRerenderable(func() string { return formatToolCallClean(string(bruto)) })
 	}
 }
 
@@ -2501,6 +2584,9 @@ func (m *Model) motivoDaConfirmacao(req mcp.Request) string {
 		return mcp.MotivoDeConfirmacao(req.Command)
 
 	default:
+		if mcp.EhExterna(req.Tool) {
+			return m.motivoExterno(req)
+		}
 		// Ler, escrever, editar, criar pasta, buscar, abrir projeto.
 		return ""
 	}
@@ -2511,6 +2597,10 @@ func (m *Model) getRequestKey(req mcp.Request) string {
 	// Combina tool + path para criar uma chave única
 	// Se houver content, inclui um hash dele para diferenciar requisições
 	key := fmt.Sprintf("%s:%s", strings.ToLower(req.Tool), req.Path)
+	if len(req.Args) > 0 {
+		b, _ := json.Marshal(req.Args)
+		key += ":" + string(b)
+	}
 	if req.Content != "" {
 		// Adiciona os primeiros 50 caracteres do conteúdo para diferenciar
 		contentPreview := req.Content
@@ -2549,119 +2639,16 @@ func (m *Model) runMCPRequests(requests []mcp.Request) []mcp.Result {
 		m.addMessage("")
 	}
 
-	for _, res := range results {
+	for i, res := range results {
 		m.renderToolResult(res)
+		m.recordIfCommand(requests, i, res)
 	}
 
 	return results
 }
 
 func (m *Model) renderToolResult(res mcp.Result) {
-	if res.Status != "success" {
-		m.addMessage(m.theme.ErrorStyle.Render(fmt.Sprintf("❌ %s (%s): %s", strings.ToLower(res.Tool), res.Path, res.Error)))
-		m.addMessage("")
-		return
-	}
-
-	tool := strings.ToLower(res.Tool)
-	switch {
-	case strings.Contains(tool, "read"):
-		// Não exibe conteúdo completo - apenas confirmação
-		lines := strings.Count(res.Content, "\n")
-		size := len(res.Content)
-		m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("✅ %s lido (%d linhas, %d bytes)", res.Path, lines, size)))
-	case strings.Contains(tool, "list"):
-		// Compacta listagem de diretórios
-		lines := strings.Split(res.Content, "\n")
-		var items []string
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "- ") {
-				items = append(items, strings.TrimPrefix(line, "- "))
-			}
-		}
-
-		if len(items) > 10 {
-			// Se muitos itens, mostra apenas contagem + primeiros/últimos
-			preview := strings.Join(items[:5], ", ")
-			lastPreview := strings.Join(items[len(items)-3:], ", ")
-			m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("📁 %s (%d itens)", res.Path, len(items))))
-			m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("Primeiros: %s", preview)))
-			m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("... e mais %d itens ...", len(items)-8)))
-			m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("Últimos: %s", lastPreview)))
-		} else if len(items) > 0 {
-			// Se poucos itens, mostra inline
-			m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("📁 %s (%d itens): %s", res.Path, len(items), strings.Join(items, ", "))))
-		} else {
-			m.addMessage(res.Content)
-		}
-	case strings.Contains(tool, "edit"):
-		// Para edit_file, mostra um diff visual
-		m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("✏️  %s", res.Content)))
-		// Se temos informações de search/replace, mostra diff
-		if res.Error == "" {
-			m.addMessage(m.theme.HelpStyle.Render("  💡 Use /logs para ver detalhes completos"))
-		}
-	case strings.Contains(tool, "write"), strings.Contains(tool, "append"):
-		m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("✅ %s", res.Content)))
-	case strings.Contains(tool, "move"):
-		m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("📦 %s", res.Content)))
-	case strings.Contains(tool, "make") || strings.Contains(tool, "dir"):
-		m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("📁 %s", res.Content)))
-	case strings.Contains(tool, "search"):
-		// Para search_files, limita o output
-		lines := strings.Split(res.Content, "\n")
-		if len(lines) > 20 {
-			preview := strings.Join(lines[:20], "\n")
-			m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("🔍 Encontrados %d resultados (exibindo 20):", len(lines))))
-			m.addMessage(preview)
-			m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("... e mais %d resultados", len(lines)-20)))
-		} else {
-			m.addMessage(res.Content)
-		}
-	case strings.Contains(tool, "execute"):
-		// Para execute_command, limita o output
-		if len(res.Content) > 1000 {
-			m.addMessage(m.theme.InfoStyle.Render(fmt.Sprintf("✅ %s", res.Content[:1000])))
-			m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("... (%d bytes omitidos)", len(res.Content)-1000)))
-		} else {
-			m.addMessage(m.theme.InfoStyle.Render(res.Content))
-		}
-	case strings.Contains(tool, "web_fetch"), strings.Contains(tool, "fetch"):
-		// Para web_fetch, mostra apenas resumo curto ao usuário (modelo recebe conteúdo completo)
-		lines := strings.Split(res.Content, "\n")
-		contentSize := len(res.Content)
-
-		// Pega apenas as primeiras linhas úteis (skip cabeçalho)
-		var preview []string
-		for i, line := range lines {
-			if i > 50 { // Máximo 50 linhas de preview
-				break
-			}
-			line = strings.TrimSpace(line)
-			if line != "" && len(line) > 10 { // Ignora linhas muito curtas
-				preview = append(preview, line)
-				if len(preview) >= 10 { // Mostra só 10 linhas úteis
-					break
-				}
-			}
-		}
-
-		m.addMessage(m.theme.InfoStyle.Render("🌐 Conteúdo web obtido com sucesso"))
-		m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("   Tamanho: %d caracteres", contentSize)))
-		if len(preview) > 0 {
-			m.addMessage(m.theme.HelpStyle.Render("   Preview:"))
-			for _, line := range preview {
-				if len(line) > 100 {
-					line = line[:100] + "..."
-				}
-				m.addMessage(m.theme.HelpStyle.Render("   " + line))
-			}
-		}
-		m.addMessage(m.theme.HelpStyle.Render("   💡 O modelo recebeu o conteúdo completo"))
-	default:
-		m.addMessage(m.theme.InfoStyle.Render(res.Content))
-	}
+	m.addRerenderable(func() string { return toolResultBlock(res, m.viewport.Width) })
 	m.addMessage("")
 }
 
@@ -2718,6 +2705,9 @@ func descreveAcao(req mcp.Request) string {
 	case "delete_file", "remove_file":
 		return "APAGAR " + req.Path
 	default:
+		if len(req.Args) > 0 {
+			return descreveExterna(req)
+		}
 		if req.Path != "" {
 			return req.Tool + " em " + req.Path
 		}
@@ -2754,8 +2744,10 @@ func (m *Model) processPendingRequests(approved bool) tea.Cmd {
 
 	if approved {
 		m.addMessage(m.theme.InfoStyle.Render("🔐 Permissão concedida. Executando operações pendentes..."))
-		results := m.runMCPRequests(m.pendingRequests)
-		m.pendingResults = append(m.pendingResults, results...)
+		reqs := append([]mcp.Request(nil), m.pendingRequests...)
+		pre := m.pendingResults
+		m.pendingResults = nil
+		return m.startTools(reqs, pre)
 	} else {
 		m.addMessage(m.theme.ErrorStyle.Render("⛔ Operações MCP negadas pelo usuário."))
 		// Registra todas as requisições negadas para evitar loop infinito
@@ -3014,17 +3006,17 @@ func (m *Model) respostaRepetida(response string) bool {
 // consultar o terminal.
 func (m *Model) glamourStyleName() string {
 	switch m.currentTheme {
-	case "light", "solarized":
+	case "light", "solarized", "solarized-light", "github-light":
 		return "light"
-	default:
-		return "dark"
 	}
+	return "dark"
 }
 
 // finishSplash escreve as mensagens de boas-vindas ao sair da tela de abertura.
 func (m *Model) finishSplash() {
 	m.addMessage("")
-	m.addMessage(m.theme.InfoStyle.Render("✨ Bem-vindo ao Amazzo Agent!"))
+	m.addMessage(lipgloss.NewStyle().Foreground(colSignal).Bold(true).Render("Amazzo") +
+		lipgloss.NewStyle().Foreground(colGraphite).Render("  agente de terminal"))
 	m.addMessage("")
 
 	if m.configManager != nil && m.configManager.IsFirstRun() {
@@ -3033,10 +3025,9 @@ func (m *Model) finishSplash() {
 		return
 	}
 
-	m.addMessage(m.theme.HelpStyle.Render(fmt.Sprintf("  Modelo: %s • Tema: %s",
-		availableModels[m.currentModel].DisplayName, m.theme.Name)))
-	m.addMessage("")
-	m.addMessage(m.theme.HelpStyle.Render("  💡 Digite /ajuda para ver os comandos • Ctrl+L para limpar"))
+	m.addMessage(lipgloss.NewStyle().Foreground(colGraphite).Render(fmt.Sprintf("Modelo %s · Tema %s",
+		shortModelName(availableModels[m.currentModel].DisplayName), m.theme.Name)))
+	m.addMessage(lipgloss.NewStyle().Foreground(colGraphite).Render("/ajuda lista os comandos · ctrl+b explorador · ctrl+g painel · /foco só o chat"))
 	m.addMessage("")
 }
 
@@ -3226,14 +3217,15 @@ func requestDoPayload(payload string) (mcp.Request, bool) {
 	// No formato de function calling os parametros vem dentro de "arguments",
 	// que alguns modelos mandam como objeto e outros como string JSON.
 	campos := obj
+	desembrulhou := false
 	if args, existe := obj["arguments"]; existe {
 		switch v := args.(type) {
 		case map[string]interface{}:
-			campos = v
+			campos, desembrulhou = v, true
 		case string:
 			var decodificado map[string]interface{}
 			if json.Unmarshal([]byte(v), &decodificado) == nil {
-				campos = decodificado
+				campos, desembrulhou = decodificado, true
 			}
 		}
 	}
@@ -3248,6 +3240,19 @@ func requestDoPayload(payload string) (mcp.Request, bool) {
 		return mcp.Request{}, false
 	}
 	req.Tool = nome
+
+	if mcp.EhExterna(nome) {
+		args := map[string]interface{}{}
+		for k, v := range campos {
+			// Sem o envelope "arguments", "tool"/"name" são o nome da chamada;
+			// dentro dele são argumentos de verdade (mcp_call usa "tool").
+			if !desembrulhou && (k == "tool" || k == "name" || k == "arguments") {
+				continue
+			}
+			args[k] = v
+		}
+		req.Args = args
+	}
 
 	return req, true
 }
@@ -3407,9 +3412,9 @@ func (m *Model) larguraDoCampo() int {
 // longo seguinte aparecia sem a primeira linha.
 func novoCampoDeTexto(largura int) textarea.Model {
 	ta := textarea.New()
-	ta.Placeholder = "Digite sua mensagem... (Shift+Enter para nova linha)"
+	ta.Placeholder = "Digite sua mensagem…  (@ arquivos · / comandos · shift+enter nova linha)"
 	ta.Focus()
-	ta.Prompt = "► "
+	ta.Prompt = "❯ "
 	ta.CharLimit = 50000
 	ta.ShowLineNumbers = false
 	ta.KeyMap.InsertNewline.SetEnabled(true) // Shift+Enter quebra linha
@@ -3483,6 +3488,10 @@ func (m *Model) mudaWorkspace(caminho string, limpaConversa bool) error {
 	m.fsManager = fs
 	m.workspaceRoot = fs.Root()
 	m.mcpServer = mcp.NewServer(fs)
+	if m.mcpMgr != nil {
+		m.mcpMgr.Configure(m.workspaceRoot, mcpConfigPaths(m.workspaceRoot))
+		m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(true))
+	}
 
 	if limpaConversa {
 		m.resetConversation()

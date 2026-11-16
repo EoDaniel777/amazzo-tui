@@ -9,7 +9,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-func (m *Model) View() string {
+// chatView desenha só a área do chat (cabeçalho, conversa, entrada e rodapé).
+func (m *Model) chatView() string {
 	// Splash screen
 	if m.showSplash {
 		if m.ultraMode {
@@ -45,18 +46,17 @@ func (m *Model) View() string {
 	}
 
 	// Calculate heights for each section
-	headerHeight := 1                         // Single line header
-	footerHeight := 1                         // Single line footer
-	inputBoxHeight := m.textarea.Height() + 6 // Input area: title + \n + content + padding(2) + border(2)
+	// Fora do modo ultra, a barra de status azul (layout_ide.go) substitui o
+	// cabeçalho e a régua de atalhos.
+	headerHeight, footerHeight := 0, 0
+	if m.ultraMode {
+		headerHeight, footerHeight = 1, 1
+	}
 
 	// Task card height (if visible)
-	taskHeight := 0
 	var taskContent string
 	if m.taskView != nil && m.taskView.IsVisible() {
 		taskContent = m.taskView.Render()
-		if taskContent != "" {
-			taskHeight = lipgloss.Height(taskContent) + 6 // content + padding(4) + border(2)
-		}
 	}
 
 	// Loading / streaming: montado aqui para que a altura seja medida de
@@ -78,11 +78,9 @@ func (m *Model) View() string {
 	}
 
 	// Agent creator height (if active)
-	agentCreatorHeight := 0
 	var agentCreatorContent string
 	if m.agentCreator != nil && m.agentCreator.IsActive() {
 		agentCreatorContent = m.agentCreator.View()
-		agentCreatorHeight = lipgloss.Height(agentCreatorContent) + 2
 	}
 
 	// Autocomplete height
@@ -91,12 +89,39 @@ func (m *Model) View() string {
 		autocompleteHeight = 15 // Fixed height for autocomplete
 	}
 
-	// Viewport gets remaining space
-	viewportHeight := m.height - headerHeight - footerHeight - inputBoxHeight -
-		taskHeight - loadingHeight - agentCreatorHeight - autocompleteHeight - 5 // -5 for safety margin
+	// ========== INPUT / TASK / AUTOCOMPLETE (montados antes para medir) ==========
+	var taskBlock string
+	if taskContent != "" {
+		taskBlock = m.modernStyles.RenderCard(taskContent, contentWidth)
+	}
 
-	if viewportHeight < 10 {
-		viewportHeight = 10
+	var inputBlock string
+	if m.agentCreator != nil && m.agentCreator.IsActive() {
+		inputBlock = m.modernStyles.RenderCard(agentCreatorContent, contentWidth)
+	} else if m.ultraMode {
+		inputBlock = m.ultimateStyles.RenderAwesomeInput(m.textarea.View(), contentWidth)
+	} else {
+		inputBlock = renderInputFrame(m.textarea.View(), contentWidth, !m.loading)
+	}
+
+	// A conversa ocupa exatamente o que sobra: o campo de digitação fica
+	// colado na barra de status (ou no painel), sem faixa vazia no meio.
+	reserved := lipgloss.Height(inputBlock)
+	if m.ultraMode {
+		reserved += headerHeight + footerHeight
+	}
+	if taskBlock != "" {
+		reserved += lipgloss.Height(taskBlock)
+	}
+	if loadingBlock != "" {
+		reserved += loadingHeight
+	}
+	if autocompleteHeight > 0 {
+		reserved += autocompleteHeight
+	}
+	viewportHeight := m.height - reserved
+	if viewportHeight < 3 {
+		viewportHeight = 3
 	}
 
 	// Update viewport size if changed
@@ -141,24 +166,6 @@ func (m *Model) View() string {
 
 	// ========== CHAT VIEWPORT ==========
 	chatArea := m.viewport.View()
-
-	// ========== TASK VIEW ==========
-	var taskBlock string
-	if taskContent != "" {
-		taskBlock = m.modernStyles.RenderCard(taskContent, contentWidth)
-	}
-
-	// ========== INPUT AREA ==========
-	var inputBlock string
-	if m.agentCreator != nil && m.agentCreator.IsActive() {
-		inputBlock = m.modernStyles.RenderCard(agentCreatorContent, contentWidth)
-	} else {
-		if m.ultraMode {
-			inputBlock = m.ultimateStyles.RenderAwesomeInput(m.textarea.View(), contentWidth)
-		} else {
-			inputBlock = renderInputFrame(m.textarea.View(), contentWidth, !m.loading)
-		}
-	}
 
 	// ========== AUTOCOMPLETE ==========
 	var autocompleteBlock string
@@ -211,7 +218,9 @@ func (m *Model) View() string {
 	// ========== ASSEMBLE UI ==========
 	var sections []string
 
-	sections = append(sections, header)
+	if m.ultraMode {
+		sections = append(sections, header)
+	}
 	sections = append(sections, chatArea)
 
 	if taskBlock != "" {
@@ -228,7 +237,9 @@ func (m *Model) View() string {
 		sections = append(sections, autocompleteBlock)
 	}
 
-	sections = append(sections, footer)
+	if m.ultraMode {
+		sections = append(sections, footer)
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }

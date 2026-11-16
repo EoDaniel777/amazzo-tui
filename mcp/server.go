@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"amazzo/filesystem"
@@ -31,8 +33,13 @@ type Request struct {
 	Pattern string `json:"pattern,omitempty"`
 	Regex   bool   `json:"regex,omitempty"`
 
+	// Campos para read_file: intervalo de linhas (1 = primeira)
+	StartLine int `json:"start_line,omitempty"`
+	EndLine   int `json:"end_line,omitempty"`
+
 	// Campos para execute_command
-	Command string `json:"command,omitempty"`
+	Command    string `json:"command,omitempty"`
+	Background bool   `json:"background,omitempty"`
 
 	// Campos para move_file
 	DestPath string `json:"dest_path,omitempty"`
@@ -40,6 +47,9 @@ type Request struct {
 	// Campos para web_fetch/web_search
 	URL   string `json:"url,omitempty"`
 	Query string `json:"query,omitempty"`
+
+	// Args são os argumentos de uma ferramenta de servidor MCP externo.
+	Args map[string]interface{} `json:"args,omitempty"`
 }
 
 // Result descreve o resultado de uma Request.
@@ -91,7 +101,52 @@ var aliases = map[string]string{
 // sabe executar.
 func FerramentaSuportada(nome string) bool {
 	_, ok := aliases[strings.ToLower(strings.TrimSpace(nome))]
-	return ok
+	return ok || EhExterna(nome)
+}
+
+// External é o que o Amazzo precisa de um conjunto de ferramentas de servidores
+// MCP externos (ver pacote mcpclient).
+type External interface {
+	Has(name string) bool
+	Call(ctx context.Context, name string, args map[string]interface{}) (string, error)
+}
+
+var (
+	externalMu sync.RWMutex
+	external   External
+)
+
+// SetExternal registra as ferramentas externas. Pode ser trocado a qualquer
+// momento: é assim que /mcp recarregar vale para a sessão em andamento.
+func SetExternal(e External) {
+	externalMu.Lock()
+	external = e
+	externalMu.Unlock()
+}
+
+// EhExterna diz se o nome é de uma ferramenta de servidor MCP externo.
+func EhExterna(nome string) bool {
+	externalMu.RLock()
+	e := external
+	externalMu.RUnlock()
+	return e != nil && e.Has(strings.TrimSpace(nome))
+}
+
+func chamaExterna(ctx context.Context, req Request) Result {
+	externalMu.RLock()
+	e := external
+	externalMu.RUnlock()
+	if e == nil {
+		return Result{Tool: req.Tool, Status: "error", Error: "nenhum servidor MCP externo carregado"}
+	}
+	// Tempo próprio: uma ferramenta lenta não pode segurar o lote para sempre.
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	texto, err := e.Call(cctx, strings.TrimSpace(req.Tool), req.Args)
+	if err != nil {
+		return Result{Tool: req.Tool, Status: "error", Error: err.Error(), Content: texto}
+	}
+	return Result{Tool: req.Tool, Status: "success", Content: texto}
 }
 
 // Handle executa a lista de requests EM ORDEM e retorna os resultados.
@@ -117,6 +172,14 @@ func (s *Server) Handle(ctx context.Context, requests []Request) ([]Result, erro
 				Error:  "execução cancelada",
 			})
 			return results, err
+		}
+		if EhExterna(req.Tool) {
+			results = append(results, chamaExterna(ctx, req))
+			continue
+		}
+		if aliases[strings.ToLower(strings.TrimSpace(req.Tool))] == "execute_command" {
+			results = append(results, s.executeCommandCtx(ctx, req))
+			continue
 		}
 		results = append(results, s.dispatch(req))
 	}
@@ -273,11 +336,29 @@ func (s *Server) readFile(req Request) Result {
 		return Result{Tool: req.Tool, Path: req.Path, Status: "error", Error: err.Error()}
 	}
 
+	texto := string(content)
+	if req.StartLine > 0 || req.EndLine > 0 {
+		linhas := strings.Split(texto, "\n")
+		total := len(linhas)
+		ini, fim := req.StartLine, req.EndLine
+		if ini < 1 {
+			ini = 1
+		}
+		if fim < 1 || fim > total {
+			fim = total
+		}
+		if ini > total {
+			return Result{Tool: req.Tool, Path: req.Path, Status: "error",
+				Error: fmt.Sprintf("%s tem só %d linhas; start_line=%d está além do fim.", req.Path, total, ini)}
+		}
+		texto = fmt.Sprintf("[linhas %d-%d de %d]\n%s", ini, fim, total, strings.Join(linhas[ini-1:fim], "\n"))
+	}
+
 	return Result{
 		Tool:    req.Tool,
 		Path:    req.Path,
 		Status:  "success",
-		Content: string(content),
+		Content: texto,
 	}
 }
 
@@ -311,14 +392,20 @@ func (s *Server) writeFile(req Request, append bool) Result {
 
 	nota += s.segredoVazando(req.Path, conteudo)
 
+	_, _, errExiste := s.fs.FileInfo(req.Path)
+	existia := errExiste == nil
+
 	path, err := s.fs.WriteFile(req.Path, []byte(conteudo), append)
 	if err != nil {
 		return Result{Tool: req.Tool, Path: req.Path, Status: "error", Error: err.Error()}
 	}
 
-	label := "salvo"
-	if append {
-		label = "atualizado"
+	label := "criado"
+	switch {
+	case append:
+		label = "atualizado (conteúdo acrescentado ao fim)"
+	case existia:
+		label = "sobrescrito (o conteúdo antigo foi substituído)"
 	}
 	return Result{
 		Tool:    req.Tool,
@@ -407,6 +494,23 @@ func (s *Server) editFile(req Request) Result {
 				"edit_file serve para trocar um trecho, e precisa de `search` e `replace`."
 		}
 		return Result{Tool: req.Tool, Path: req.Path, Status: "error", Error: erro}
+	}
+
+	// Trecho que aparece mais de uma vez: trocar tudo em silêncio estraga o
+	// arquivo. Pede mais contexto, com as linhas onde ele aparece.
+	if atual, errLer := s.fs.ReadFile(req.Path); errLer == nil {
+		texto := string(atual)
+		if n := strings.Count(texto, req.Search); n > 1 {
+			var onde []string
+			for i, l := range strings.Split(texto, "\n") {
+				if strings.Contains(l, strings.SplitN(req.Search, "\n", 2)[0]) && len(onde) < 6 {
+					onde = append(onde, fmt.Sprintf("linha %d: %s", i+1, strings.TrimSpace(l)))
+				}
+			}
+			return Result{Tool: req.Tool, Path: req.Path, Status: "error",
+				Error: fmt.Sprintf("o trecho aparece %d vezes e nada foi alterado. Inclua mais linhas ao redor em `search` para torná-lo único.\n%s",
+					n, strings.Join(onde, "\n"))}
+		}
 	}
 
 	message, err := s.fs.EditFile(req.Path, req.Search, req.Replace)
@@ -749,6 +853,10 @@ func (s *Server) buscaPorNome(req Request, pattern, dir, resolved string) Result
 }
 
 func (s *Server) executeCommand(req Request) Result {
+	return s.executeCommandCtx(context.Background(), req)
+}
+
+func (s *Server) executeCommandCtx(ctx context.Context, req Request) Result {
 	command := req.Command
 	if command == "" {
 		return Result{Tool: req.Tool, Status: "error", Error: "execute_command requer `command`"}
@@ -765,9 +873,28 @@ func (s *Server) executeCommand(req Request) Result {
 		}
 	}
 
-	// Build e teste de projeto grande passam de um minuto.
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
+	command = s.resolveLocalBinary(command)
+
+	// Comandos que terminam sozinhos (build, teste, instalação) ganham tempo
+	// de sobra. O resto pode ser um programa que NUNCA termina (um servidor,
+	// um bot, uma TUI): depois de alguns segundos ele vai para segundo plano
+	// e o agente recebe o começo da saída, em vez de ficar preso e levar um
+	// "timeout" que parecia falha do comando.
+	limite := tempoParaSegundoPlano
+	if comandoFinito(command) {
+		limite = tempoMaximoFinito
+	}
+	// O modelo sabe que é um servidor/bot: não faz sentido esperar.
+	if req.Background {
+		limite = 3 * time.Second
+	}
+
+	// A saída vai para um arquivo: assim ela continua sendo gravada depois que
+	// o comando vai para segundo plano, e o agente pode ler com tail.
+	logPath, logFile, err := novoLogDeComando()
+	if err != nil {
+		return Result{Tool: req.Tool, Status: "error", Error: fmt.Sprintf("Não consegui preparar o log do comando: %v", err)}
+	}
 
 	// Executa através do shell, dentro da pasta de trabalho.
 	//
@@ -775,22 +902,52 @@ func (s *Server) executeCommand(req Request) Result {
 	// "cd docs && ls" virava o comando "cd" com "&&" e "ls" como argumentos.
 	// Sem shell não há &&, pipe, redirecionamento nem glob — justamente o que
 	// se usa para trabalhar num projeto.
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = s.fs.Root()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	// Grupo próprio: o programa em segundo plano sobrevive ao Ctrl+C do
+	// terminal, e dá para encerrar o shell junto com os filhos dele.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	output, err := cmd.CombinedOutput()
-	outputStr := string(output)
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return Result{Tool: req.Tool, Status: "error", Error: fmt.Sprintf("Comando falhou: %v", err)}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		e := cmd.Wait()
+		logFile.Close()
+		done <- e
+	}()
+
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-ctx.Done():
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return Result{Tool: req.Tool, Status: "error", Error: "comando interrompido pelo usuário",
+			Content: lerFimDoLog(logPath, 4000)}
+	case <-time.After(limite):
+		trecho := lerFimDoLog(logPath, 4000)
+		if trecho == "" {
+			trecho = "(ainda sem saída)"
+		}
+		return Result{
+			Tool:   req.Tool,
+			Status: "success",
+			Content: fmt.Sprintf("O comando continua rodando em segundo plano (pid %d), depois de %s.\n"+
+				"Saída até agora:\n%s\n\n"+
+				"Para ver mais: execute_command com `tail -n 50 %s`. Para parar: `kill -- -%d`.",
+				cmd.Process.Pid, limite, trecho, logPath, cmd.Process.Pid),
+		}
+	}
+
+	outputStr := lerFimDoLog(logPath, 64000)
+	err = waitErr
 
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return Result{
-				Tool:    req.Tool,
-				Status:  "error",
-				Error:   "Comando excedeu o timeout de 120 segundos",
-				Content: outputStr,
-			}
-		}
-
 		return Result{
 			Tool:    req.Tool,
 			Status:  "error",
@@ -1032,4 +1189,79 @@ Alternativas:
 
 Para agora, recomende URLs conhecidas ou peça ao usuário os links.`, req.Query),
 	}
+}
+
+const (
+	// Quanto esperar por um comando de natureza desconhecida antes de movê-lo
+	// para segundo plano.
+	tempoParaSegundoPlano = 12 * time.Second
+	// Teto para comandos que terminam sozinhos. Fica abaixo dos 5 minutos que
+	// o app dá ao lote inteiro de ferramentas.
+	tempoMaximoFinito = 4 * time.Minute
+)
+
+// prefixosFinitos são comandos que sempre terminam, mesmo demorando.
+var prefixosFinitos = []string{
+	"go build", "go test", "go vet", "go mod", "go get", "go install", "go generate", "go fmt", "gofmt",
+	"make", "cmake", "cargo build", "cargo test", "cargo check",
+	"npm install", "npm ci", "npm run build", "npm test", "yarn install", "yarn build", "pnpm install", "pnpm build",
+	"pip install", "pip3 install", "apt ", "pacman ", "git clone", "git pull", "git fetch",
+}
+
+// comandoFinito diz se o comando é do tipo que termina por conta própria.
+func comandoFinito(command string) bool {
+	c := strings.ToLower(strings.TrimSpace(command))
+	for _, p := range prefixosFinitos {
+		if strings.HasPrefix(c, p) || strings.Contains(c, "&& "+p) {
+			return true
+		}
+	}
+	return false
+}
+
+var nomeSimples = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+
+// resolveLocalBinary troca "meuapp" por "./meuapp" quando o comando não está
+// no PATH mas existe um executável com esse nome na pasta de trabalho. Era o
+// erro mais comum: o modelo escrevia o nome sem "./" e recebia exit 127.
+func (s *Server) resolveLocalBinary(command string) string {
+	campos := strings.Fields(command)
+	if len(campos) == 0 || !nomeSimples.MatchString(campos[0]) {
+		return command
+	}
+	if _, err := exec.LookPath(campos[0]); err == nil {
+		return command
+	}
+	info, err := os.Stat(filepath.Join(s.fs.Root(), campos[0]))
+	if err != nil || info.IsDir() || info.Mode()&0111 == 0 {
+		return command
+	}
+	return "./" + command
+}
+
+// novoLogDeComando cria o arquivo onde a saída do comando é gravada.
+func novoLogDeComando() (string, *os.File, error) {
+	dir := filepath.Join(os.TempDir(), "amazzo-bg")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+	f, err := os.CreateTemp(dir, "cmd-*.log")
+	if err != nil {
+		return "", nil, err
+	}
+	return f.Name(), f, nil
+}
+
+// lerFimDoLog devolve os últimos max bytes do arquivo de saída.
+func lerFimDoLog(path string, max int64) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err == nil && info.Size() > max {
+		f.Seek(info.Size()-max, 0)
+	}
+	b, _ := io.ReadAll(f)
+	return string(b)
 }

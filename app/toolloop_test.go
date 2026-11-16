@@ -375,6 +375,7 @@ func TestAberturaDePastaNaoDuplicaOEvento(t *testing.T) {
 func TestContadorDeFerramentasEhCumulativo(t *testing.T) {
 	m := novoModelDeTeste(t)
 	m.width, m.height = 140, 40
+	m.ide.termW, m.ide.termH = 140, 40
 	m.toolCallsTotal = 4
 	m.toolRuns = 0
 

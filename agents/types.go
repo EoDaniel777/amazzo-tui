@@ -77,6 +77,7 @@ type ModelConfig struct {
 	Name        string
 	DisplayName string
 	Endpoint    string
+	Provider    string // ollama | amazzo | hf
 }
 
 // Task representa uma tarefa a ser executada por um agente.

@@ -302,26 +302,53 @@ func novoModelDeTeste(t *testing.T) *Model {
 	return m
 }
 
-// Quem só usa Ollama não tem token do Hugging Face. Escolher um modelo remoto
-// nesse estado precisa dar uma mensagem acionável, não um erro de API.
-func TestModeloRemotoSemTokenExplicaOQueFazer(t *testing.T) {
-	m := novoModelDeTeste(t)
-	m.hfToken = ""
-
-	// Primeiro modelo remoto da lista.
-	for i, cfg := range availableModels {
-		if !isLocalModel(cfg) {
-			m.currentModel = i
-			break
+// Quem só usa Ollama não tem chave de nuvem. Escolher um modelo remoto nesse
+// estado precisa dar uma mensagem acionável, não um erro de API.
+func TestModeloRemotoSemChaveExplicaOQueFazer(t *testing.T) {
+	casos := []struct {
+		provider, dica string
+	}{
+		{providerAmazzo, "AMAZZO_API_KEY"},
+		{providerHF, "/key"},
+	}
+	for _, c := range casos {
+		m := novoModelDeTeste(t)
+		m.hfToken = ""
+		m.cloud = cloudAccess{}
+		m.currentModel = -1
+		for i, cfg := range composeModels(nil, true) {
+			if cfg.Provider == c.provider {
+				availableModels = composeModels([]agents.ModelConfig{fallbackLocalModel}, true)
+				m.currentModel = i + 1 // +1: o modelo local fica na frente
+				break
+			}
+		}
+		msg, ok := m.callAPI("oi")().(apiResponseMsg)
+		if !ok || msg.err == nil {
+			t.Fatalf("%s: esperava um erro explicativo, obtive %#v", c.provider, msg)
+		}
+		if !strings.Contains(msg.err.Error(), c.dica) || !strings.Contains(msg.err.Error(), "/modelo") {
+			t.Errorf("%s: o erro precisa dizer como resolver: %v", c.provider, msg.err)
 		}
 	}
+}
 
-	msg, ok := m.callAPI("oi")().(apiResponseMsg)
-	if !ok || msg.err == nil {
-		t.Fatalf("esperava um erro explicativo, obtive %#v", msg)
+func TestListaSeparaLocalENuvem(t *testing.T) {
+	lista := composeModels([]agents.ModelConfig{{Name: "x", DisplayName: "🏠 x (Ollama)", Endpoint: "x"}}, false)
+	grupos := map[string]int{}
+	for _, c := range lista {
+		grupos[modelGroup(c)]++
 	}
-	if !strings.Contains(msg.err.Error(), "/key") || !strings.Contains(msg.err.Error(), "/modelo") {
-		t.Errorf("o erro precisa dizer como resolver: %v", msg.err)
+	if grupos["Local · roda na sua GPU"] != 1 || grupos["Nuvem · amazzo.tech"] != len(cloudModels) {
+		t.Fatalf("grupos inesperados: %v", grupos)
+	}
+	if len(cloudModels) != 19 {
+		t.Errorf("esperava os 19 modelos do amazzo.tech, há %d", len(cloudModels))
+	}
+	for _, c := range lista {
+		if strings.Contains(c.DisplayName, "Hugging") || c.Provider == providerHF {
+			t.Errorf("sem token do HF, os modelos dele não entram: %v", c)
+		}
 	}
 }
 
