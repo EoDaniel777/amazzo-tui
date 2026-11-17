@@ -12,7 +12,7 @@ modelos de IA e trabalhar nos arquivos do diretório atual.
 - Modelos do Hugging Face, quando há um `HF_TOKEN` configurado (opcional).
 - Layout estilo editor: explorador de arquivos, chat, painel de saída e barra de status.
 - Ferramentas de arquivo e de shell, com permissão para o que é arriscado.
-- Cliente MCP: usa os servidores configurados no `opencode.json`, se houver.
+- Cliente MCP próprio: você adiciona os servidores com `amazzo add mcp <nome>`.
 - 23 temas de cores (`/temas`), agentes especializados (`/agentes`).
 
 ## Requisitos
@@ -92,15 +92,20 @@ modelo vem desligado, por ser bem mais rápido; `/pensar` liga e desliga
 
 ## Servidores MCP
 
-A TUI é cliente MCP (stdio e HTTP). Ela lê os servidores dos arquivos abaixo,
-do mais geral para o mais específico:
+A TUI é cliente MCP (stdio e HTTP) e usa **só a configuração própria**: nada é
+lido de outras ferramentas. Sem servidores adicionados, nenhum é iniciado.
 
-1. `~/.config/opencode/opencode.json` (chave `mcp`)
-2. `~/.config/amazzo/mcp.json`
-3. na pasta do projeto: `opencode.json`, `.mcp.json` ou `.amazzo/mcp.json`
+```sh
+amazzo add mcp context7                                   # servidor conhecido
+amazzo add mcp api https://exemplo.com/mcp --header "Authorization=Bearer X"
+amazzo add mcp meu --env CHAVE=valor -- npx -y pacote-mcp # servidor local
+amazzo mcp list
+amazzo mcp remove context7
+```
 
-Aceita o formato do opencode (`"mcp": {nome: {type, command[], url, environment}}`)
-e o do `.mcp.json` (`"mcpServers": {nome: {command, args, env}}`).
+Os servidores ficam em `~/.config/amazzo/mcp.json`; com `--projeto` vão para
+`.amazzo/mcp.json` na pasta atual (esse vence o global). Dentro da TUI, o mesmo:
+`/mcp add context7`.
 
 As ferramentas aparecem para o modelo como `servidor_ferramenta`. Para não
 estourar o contexto, só entram no prompt até ~1500 tokens de schemas; o
@@ -109,6 +114,7 @@ restante fica disponível por `mcp_search` e `mcp_call`.
 | Comando | O que faz |
 |---|---|
 | `/mcp` | lista os servidores e o estado de cada um |
+| `/mcp add <nome> …` · `/mcp remover <nome>` | adiciona ou remove um servidor |
 | `/mcp recarregar` | relê a configuração e reinicia os servidores, sem fechar a sessão |
 | `/mcp ligar\|desligar <nome>` | liga ou desliga um servidor (persistente) |
 | `/mcp confiar\|desconfiar <nome>` | para de pedir (ou volta a pedir) permissão a cada chamada |

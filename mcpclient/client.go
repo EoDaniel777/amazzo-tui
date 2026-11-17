@@ -1,8 +1,8 @@
 // Package mcpclient fala com servidores MCP externos (stdio e HTTP) e os
 // expõe como ferramentas para o modelo.
 //
-// O Amazzo já tinha um "mcp" próprio (arquivos, comandos), mas nenhum cliente:
-// servidores configurados no opencode.json ficavam invisíveis.
+// Os servidores vêm só da configuração do próprio Amazzo (ver ConfigPaths);
+// configs de outras ferramentas não são lidas.
 package mcpclient
 
 import (

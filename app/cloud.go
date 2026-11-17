@@ -55,7 +55,6 @@ func loadCloudAccess() cloudAccess {
 	home, _ := os.UserHomeDir()
 	for _, p := range []string{
 		filepath.Join(home, ".config", "opencode", "opencode.json"),
-		filepath.Join(home, ".config", "amazzo", "mcp.json"), // não tem provider; ignorado
 	} {
 		raw, err := os.ReadFile(p)
 		if err != nil {

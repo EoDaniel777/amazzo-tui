@@ -16,45 +16,36 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// Servidores MCP externos (os mesmos do opencode, em ~/.config/opencode/opencode.json).
-// aparecem para o modelo como ferramentas "servidor_ferramenta".
+// Servidores MCP externos, adicionados pelo usuário ao Amazzo
+// (`amazzo add mcp` ou /mcp add). Aparecem para o modelo como ferramentas "servidor_ferramenta".
 
 type mcpReloadedMsg struct {
 	status []mcpclient.Status
 	quiet  bool
 }
 
-// mcpConfigPaths lista onde procurar servidores, do menos para o mais
-// específico: global do opencode, global do Amazzo, depois a pasta do projeto.
+// mcpConfigPaths: só a configuração do próprio Amazzo (global e do projeto).
 func mcpConfigPaths(workspace string) []string {
-	home, _ := os.UserHomeDir()
-	paths := []string{
-		filepath.Join(home, ".config", "opencode", "opencode.json"),
-		filepath.Join(home, ".config", "amazzo", "mcp.json"),
-	}
-	if workspace != "" {
-		paths = append(paths,
-			filepath.Join(workspace, "opencode.json"),
-			filepath.Join(workspace, ".mcp.json"),
-			filepath.Join(workspace, ".amazzo", "mcp.json"))
-	}
-	return paths
+	return mcpclient.ConfigPaths(workspace)
 }
 
 func (m *Model) initMCP() {
 	home, _ := os.UserHomeDir()
 	m.mcpMgr = mcpclient.NewManager(m.workspaceRoot, mcpConfigPaths(m.workspaceRoot),
 		filepath.Join(home, ".config", "amazzo", "mcp-estado.json"))
-	mcp.SetExternal(mcpAdapter{m.mcpMgr})
+	mcp.SetExternal(mcpAdapter{m.mcpMgr, func() string { return m.workspaceRoot }})
 }
 
 // mcpAdapter liga o gerenciador ao executor de ferramentas, e acrescenta duas
 // ferramentas próprias: o modelo consegue recarregar os servidores sozinho.
-type mcpAdapter struct{ mgr *mcpclient.Manager }
+type mcpAdapter struct {
+	mgr *mcpclient.Manager
+	ws  func() string
+}
 
 func (a mcpAdapter) Has(name string) bool {
 	switch name {
-	case "mcp_reload", "mcp_list", "mcp_search", "mcp_call":
+	case "mcp_reload", "mcp_list", "mcp_search", "mcp_call", "mcp_add", "mcp_remove":
 		return true
 	}
 	return a.mgr.Has(name)
@@ -64,6 +55,20 @@ func (a mcpAdapter) Call(ctx context.Context, name string, args map[string]inter
 	switch name {
 	case "mcp_reload":
 		return resumoMCP(a.mgr.Reload(ctx), a.mgr), nil
+	case "mcp_add":
+		return a.add(ctx, args)
+	case "mcp_remove":
+		nome, _ := args["name"].(string)
+		achou := false
+		for _, p := range mcpclient.ConfigPaths(a.ws()) {
+			if ok, _ := mcpclient.RemoveServer(p, nome); ok {
+				achou = true
+			}
+		}
+		if !achou {
+			return "", fmt.Errorf("servidor %q não está na configuração do Amazzo", nome)
+		}
+		return "Removido. " + resumoMCP(a.mgr.Reload(ctx), a.mgr), nil
 	case "mcp_list":
 		return resumoMCP(a.mgr.Statuses(), a.mgr), nil
 	case "mcp_search":
@@ -80,9 +85,54 @@ func (a mcpAdapter) Call(ctx context.Context, name string, args map[string]inter
 	return a.mgr.Call(ctx, name, args)
 }
 
+// add grava um servidor na configuração do Amazzo e já reconecta, para o modelo
+// poder usar as ferramentas na mesma conversa.
+func (a mcpAdapter) add(ctx context.Context, args map[string]interface{}) (string, error) {
+	cfg := mcpclient.ServerConfig{Env: map[string]string{}, Headers: map[string]string{}}
+	cfg.Name, _ = args["name"].(string)
+	if u, _ := args["url"].(string); u != "" {
+		cfg.Remote, cfg.URL = true, u
+	}
+	switch c := args["command"].(type) {
+	case string:
+		if c != "" {
+			cfg.Command = append(cfg.Command, c)
+		}
+	case []interface{}:
+		for _, x := range c {
+			cfg.Command = append(cfg.Command, fmt.Sprint(x))
+		}
+	}
+	if xs, ok := args["args"].([]interface{}); ok && len(cfg.Command) > 0 {
+		for _, x := range xs {
+			cfg.Command = append(cfg.Command, fmt.Sprint(x))
+		}
+	}
+	for k, dst := range map[string]map[string]string{"env": cfg.Env, "headers": cfg.Headers} {
+		if mp, ok := args[k].(map[string]interface{}); ok {
+			for ek, ev := range mp {
+				dst[ek] = fmt.Sprint(ev)
+			}
+		}
+	}
+	if !cfg.Remote && len(cfg.Command) == 0 {
+		if p, ok := mcpclient.Presets[strings.ToLower(cfg.Name)]; ok {
+			cfg.Command = p.Command
+		}
+	}
+	path := mcpclient.GlobalConfigPath()
+	if esc, _ := args["scope"].(string); esc == "project" && a.ws() != "" {
+		path = mcpclient.ProjectConfigPath(a.ws())
+	}
+	if err := mcpclient.AddServer(path, cfg); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Servidor %q gravado em %s.\n%s", cfg.Name, path, resumoMCP(a.mgr.Reload(ctx), a.mgr)), nil
+}
+
 func resumoMCP(st []mcpclient.Status, mgr *mcpclient.Manager) string {
 	if len(st) == 0 {
-		return "Nenhum servidor MCP configurado (veja ~/.config/opencode/opencode.json, chave \"mcp\")."
+		return "Nenhum servidor MCP configurado. Adicione com /mcp add <nome>."
 	}
 	var sb strings.Builder
 	tools := mgr.Tools()
@@ -140,7 +190,7 @@ func hasMCPFailure(st []mcpclient.Status) bool {
 
 func (m *Model) mcpReport(st []mcpclient.Status) string {
 	if len(st) == 0 {
-		return renderNotice("◆", "Nenhum servidor MCP configurado. Adicione em ~/.config/opencode/opencode.json (chave \"mcp\") ou ~/.config/amazzo/mcp.json.", colGraphite)
+		return renderNotice("◆", "Nenhum servidor MCP configurado. Adicione com /mcp add <nome> (ex.: /mcp add context7).", colGraphite)
 	}
 	var sb strings.Builder
 	sb.WriteString(renderNotice("◆", "Servidores MCP", colSignal))
@@ -195,6 +245,8 @@ func (m *Model) handleMCPCommand(input string) bool {
 	case "", "status", "lista":
 		m.addMessage(m.mcpReport(m.mcpMgr.Statuses()))
 		m.addMessage("")
+	case "add", "adicionar", "remover", "remove":
+		m.mcpAddRemove(sub, campos[2:])
 	case "recarregar", "reload", "reiniciar", "source":
 		m.addMessage(renderNotice("↻", "Recarregando servidores MCP (relê a configuração e reinicia todos)…", colGraphite))
 		m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(false))
@@ -238,10 +290,46 @@ func (m *Model) handleMCPCommand(input string) bool {
 		m.addMessage(strings.Join(linhas, "\n"))
 		m.addMessage("")
 	default:
-		m.addMessage(renderNotice("!", "Uso: /mcp [recarregar|ligar|desligar|confiar|desconfiar|ferramentas] [servidor]", colAct))
+		m.addMessage(renderNotice("!", "Uso: /mcp [add|remover|recarregar|ligar|desligar|confiar|desconfiar|ferramentas] [servidor]", colAct))
 	}
 	m.viewport.GotoBottom()
 	return true
+}
+
+// mcpAddRemove trata "/mcp add ..." e "/mcp remover <nome>" e recarrega.
+func (m *Model) mcpAddRemove(sub string, args []string) {
+	if sub == "add" || sub == "adicionar" {
+		cfg, projeto, err := mcpclient.ParseAddArgs(args)
+		if err == nil {
+			path := mcpclient.GlobalConfigPath()
+			if projeto {
+				path = mcpclient.ProjectConfigPath(m.workspaceRoot)
+			}
+			if err = mcpclient.AddServer(path, cfg); err == nil {
+				m.addMessage(renderNotice("✓", fmt.Sprintf("Servidor %q adicionado em %s. Conectando…", cfg.Name, path), colEmber))
+				m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(false))
+			}
+		}
+		if err != nil {
+			m.addMessage(renderNotice("✗", err.Error(), colAlarm))
+		}
+	} else if len(args) == 0 {
+		m.addMessage(renderNotice("!", "Informe o servidor: /mcp remover <nome>", colAct))
+	} else {
+		achou := false
+		for _, p := range mcpclient.ConfigPaths(m.workspaceRoot) {
+			if ok, _ := mcpclient.RemoveServer(p, args[0]); ok {
+				achou = true
+			}
+		}
+		if achou {
+			m.addMessage(renderNotice("✓", fmt.Sprintf("Servidor %q removido.", args[0]), colEmber))
+			m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(false))
+		} else {
+			m.addMessage(renderNotice("✗", fmt.Sprintf("Servidor %q não encontrado na configuração do Amazzo.", args[0]), colAlarm))
+		}
+	}
+	m.addMessage("")
 }
 
 // toolSchemas junta as ferramentas internas com as dos servidores MCP.
@@ -250,6 +338,7 @@ func (m *Model) toolSchemas() []agents.Tool {
 	if m.mcpMgr == nil {
 		return base
 	}
+	base = append(base, mcpAddTool(), mcpRemoveTool())
 	ext := m.mcpMgr.Tools()
 	if len(ext) == 0 && len(m.mcpMgr.Statuses()) == 0 {
 		return base
@@ -312,6 +401,35 @@ func (m *Model) toolSchemas() []agents.Tool {
 	return base
 }
 
+func mcpAddTool() agents.Tool {
+	str := func(d string) map[string]interface{} { return map[string]interface{}{"type": "string", "description": d} }
+	obj := func(d string) map[string]interface{} { return map[string]interface{}{"type": "object", "description": d} }
+	return agents.Tool{Type: agents.ToolTypeFunction, Function: agents.Function{
+		Name: "mcp_add",
+		Description: "Adiciona um servidor MCP à configuração do Amazzo e conecta na hora; as ferramentas ficam disponíveis em seguida. " +
+			"Use quando o usuário pedir. Para um projeto que já define servidores MCP (ex.: .mcp.json, opencode.json), leia o arquivo e adicione cada um com scope=project. " +
+			"Nunca copie configs de outras ferramentas sem o usuário pedir.",
+		Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{
+			"name":    str("nome do servidor (ex.: context7)"),
+			"command": str("executável, para servidor local (stdio)"),
+			"args":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "argumentos do comando"},
+			"url":     str("endereço, para servidor remoto (HTTP)"),
+			"env":     obj("variáveis de ambiente"),
+			"headers": obj("cabeçalhos HTTP"),
+			"scope":   str("project (só esta pasta) ou global (padrão)"),
+		}, "required": []string{"name"}},
+	}}
+}
+
+func mcpRemoveTool() agents.Tool {
+	return agents.Tool{Type: agents.ToolTypeFunction, Function: agents.Function{
+		Name:        "mcp_remove",
+		Description: "Remove um servidor MCP da configuração do Amazzo.",
+		Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{
+			"name": map[string]interface{}{"type": "string"}}, "required": []string{"name"}},
+	}}
+}
+
 // textoDosSchemasExternos mede o que as ferramentas externas custam no prompt.
 func (m *Model) textoDosSchemasExternos() string {
 	if m.mcpMgr == nil {
@@ -366,6 +484,16 @@ func (m *Model) motivoExterno(req mcp.Request) string {
 		return ""
 	}
 	alvo := req.Tool
+	if alvo == "mcp_add" {
+		cmd, _ := req.Args["command"].(string)
+		if u, _ := req.Args["url"].(string); u != "" {
+			cmd = u
+		}
+		return fmt.Sprintf("adiciona o servidor MCP %v (%s), que será executado/conectado", req.Args["name"], cmd)
+	}
+	if alvo == "mcp_remove" {
+		return ""
+	}
 	if alvo == "mcp_call" {
 		alvo, _ = req.Args["tool"].(string)
 	}

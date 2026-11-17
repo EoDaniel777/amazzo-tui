@@ -175,7 +175,7 @@ done
 	if r := buscaFerramentasMCP(m.mcpMgr, "numero 42"); !strings.Contains(r, "grande_ferr42") {
 		t.Errorf("busca não achou: %s", r)
 	}
-	mcp.SetExternal(mcpAdapter{m.mcpMgr})
+	mcp.SetExternal(mcpAdapter{m.mcpMgr, func() string { return "" }})
 	defer mcp.SetExternal(nil)
 	reqs := m.parseToolRequests(`{"name":"mcp_call","arguments":{"tool":"grande_ferr7","arguments":{"name":"x"}}}`)
 	if len(reqs) != 1 || reqs[0].Args["tool"] != "grande_ferr7" {
@@ -184,5 +184,28 @@ done
 	inner, _ := reqs[0].Args["arguments"].(map[string]interface{})
 	if inner["name"] != "x" {
 		t.Errorf("argumento 'name' foi perdido: %+v", reqs[0].Args)
+	}
+}
+
+func TestMcpAddPeloModelo(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := t.TempDir()
+	mgr := mcpclient.NewManager(dir, mcpclient.ConfigPaths(dir), "")
+	defer mgr.Close()
+	a := mcpAdapter{mgr, func() string { return dir }}
+	out, err := a.Call(context.Background(), "mcp_add", map[string]interface{}{
+		"name": "x", "command": "/nao/existe", "scope": "project"})
+	if err != nil || !strings.Contains(out, ".amazzo/mcp.json") {
+		t.Fatalf("add: %q %v", out, err)
+	}
+	if len(mcpclient.LoadConfigs(mcpclient.ConfigPaths(dir))) != 1 {
+		t.Fatal("servidor não foi gravado")
+	}
+	if _, err := a.Call(context.Background(), "mcp_remove", map[string]interface{}{"name": "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(mcpclient.LoadConfigs(mcpclient.ConfigPaths(dir))) != 0 {
+		t.Fatal("servidor devia ter sido removido")
 	}
 }

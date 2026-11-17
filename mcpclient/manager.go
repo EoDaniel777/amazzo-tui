@@ -120,9 +120,9 @@ func remove(l []string, s string) []string {
 	return out
 }
 
-// LoadConfigs lê servidores de vários arquivos. Entende o formato do opencode
-// ("mcp": {nome: {type, command[], url, environment}}) e o do Claude/.mcp.json
-// ("mcpServers": {nome: {command, args, env}}).
+// LoadConfigs lê servidores de vários arquivos. O formato gravado pelo Amazzo é
+// "mcpServers": {nome: {command, args, env}} ou {url, headers}; a forma
+// "mcp": {nome: {command[], url, environment}} também é entendida.
 func LoadConfigs(paths []string) []ServerConfig {
 	byName := map[string]ServerConfig{}
 	var order []string
