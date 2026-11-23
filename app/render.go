@@ -258,19 +258,26 @@ func renderToolErrorCard(res mcp.Result, width int) string {
 	if res.Path != "" {
 		titulo += " " + dim.Render(res.Path)
 	}
+	res.Error = limpaTexto(res.Error)
+	res.Content = limpaTexto(res.Content)
 	linhas := []string{titulo, dim.Render(strings.TrimSpace(res.Error))}
 	// A saída do comando (stderr) é o que explica a falha.
 	if saida := strings.Split(strings.TrimSpace(res.Content), "\n"); strings.TrimSpace(res.Content) != "" {
-		if len(saida) > 4 {
-			saida = saida[len(saida)-4:]
+		if len(saida) > 6 {
+			saida = saida[len(saida)-6:]
 		}
-		for _, l := range saida {
+		for _, l := range cortaLinhas(saida, max(20, width-10)) {
 			linhas = append(linhas, dim.Render(l))
 		}
 	}
 
+	// A dica de PATH vale só para comando que não existe: aparecia também em
+	// "padrão não encontrado" de edit_file, mandando o modelo atrás de um
+	// binário que nada tinha a ver com o erro.
 	erro := strings.ToLower(res.Error)
-	if strings.Contains(erro, "127") || strings.Contains(erro, "not found") || strings.Contains(erro, "não encontrado") {
+	ehComando := strings.Contains(strings.ToLower(res.Tool), "exec")
+	if ehComando && (strings.Contains(erro, "exit status 127") || strings.Contains(erro, "command not found") ||
+		strings.Contains(erro, "executable file not found") || strings.Contains(erro, "não encontrado no path")) {
 		linhas = append(linhas,
 			lipgloss.NewStyle().Foreground(colAct).Render("dica: ")+
 				"comando fora do PATH. Instale ou compile o binário antes de rodar.")

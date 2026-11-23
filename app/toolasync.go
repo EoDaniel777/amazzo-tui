@@ -85,8 +85,11 @@ func (m *Model) finishTools(msg toolsDoneMsg) tea.Cmd {
 	}
 
 	m.loading = true
-	m.addMessage(renderNotice("↻", fmt.Sprintf("ciclo %d/%d — devolvendo o resultado ao modelo", m.toolRuns, 15), colGraphite))
-	return tea.Batch(m.spinner.Tick, m.continuaAposFerramentas(todos))
+	cmd := m.continuaAposFerramentas(todos)
+
+	// Sem limite de ciclos nem detector de loop: o modelo decide quando a
+	// tarefa e pequena ou longa, e quem quiser parar usa Esc.
+	return tea.Batch(m.spinner.Tick, cmd)
 }
 
 // interrompeFerramentas cancela o lote em andamento (Esc).

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +40,13 @@ type Request struct {
 	Command    string `json:"command,omitempty"`
 	Background bool   `json:"background,omitempty"`
 
+	// Campos para job_output / job_stop
+	Task string `json:"task,omitempty"`
+	// Offset: a partir de qual caractere continuar a leitura de web_fetch.
+	Offset int `json:"offset,omitempty"`
+	JobID  int `json:"job_id,omitempty"`
+	Lines  int `json:"lines,omitempty"`
+
 	// Campos para move_file
 	DestPath string `json:"dest_path,omitempty"`
 
@@ -59,11 +65,58 @@ type Result struct {
 	Status  string `json:"status"`
 	Content string `json:"content,omitempty"`
 	Error   string `json:"error,omitempty"`
+
+	// Preview é o que o usuário vê do que mudou (linhas "+"/"-"). Nao vai
+	// para o modelo: ele ja sabe o que escreveu.
+	Preview string `json:"preview,omitempty"`
+	// Lines e Bytes descrevem o arquivo depois da operacao.
+	Lines int `json:"lines,omitempty"`
+	Bytes int `json:"bytes,omitempty"`
 }
 
 // Server coordena a execução das requests em paralelo.
 type Server struct {
 	fs *filesystem.Manager
+
+	delegarMu sync.RWMutex
+	delegar   func(ctx context.Context, tarefa string) (string, error)
+}
+
+// DefineDelegar liga a ferramenta subagent a quem sabe conversar com o modelo.
+func (s *Server) DefineDelegar(f func(ctx context.Context, tarefa string) (string, error)) {
+	s.delegarMu.Lock()
+	s.delegar = f
+	s.delegarMu.Unlock()
+}
+
+// subagente roda uma tarefa de pesquisa num agente próprio e devolve só a
+// conclusão: os arquivos que ele leu não entram no contexto de quem delegou.
+func (s *Server) subagente(ctx context.Context, req Request) Result {
+	tarefa := strings.TrimSpace(req.Task)
+	if tarefa == "" {
+		tarefa = strings.TrimSpace(req.Query)
+	}
+	if tarefa == "" {
+		tarefa = strings.TrimSpace(req.Content)
+	}
+	if tarefa == "" {
+		return Result{Tool: req.Tool, Status: "error", Error: "subagent requer `task` (o que o subagente deve descobrir)"}
+	}
+	s.delegarMu.RLock()
+	f := s.delegar
+	s.delegarMu.RUnlock()
+	if f == nil {
+		return Result{Tool: req.Tool, Status: "error", Error: "subagentes só funcionam com modelos remotos; faça você mesmo"}
+	}
+	resp, err := f(ctx, tarefa)
+	curta := tarefa
+	if len([]rune(curta)) > 80 {
+		curta = string([]rune(curta)[:80]) + "…"
+	}
+	if err != nil {
+		return Result{Tool: req.Tool, Path: curta, Status: "error", Error: "subagente falhou: " + err.Error(), Content: resp}
+	}
+	return Result{Tool: req.Tool, Path: curta, Status: "success", Content: resp}
 }
 
 // NewServer cria um MCP Server baseado no filesystem seguro.
@@ -91,6 +144,8 @@ var aliases = map[string]string{
 	"move_file": "move_file", "mv": "move_file", "rename": "move_file",
 	"web_fetch": "web_fetch", "fetch_url": "web_fetch",
 	"web_search": "web_search", "search_web": "web_search",
+	"subagent": "subagent", "task": "subagent", "delegate": "subagent",
+	"job_list": "job_list", "job_output": "job_output", "job_stop": "job_stop",
 
 	// set_workspace é resolvida pelo app (muda o alcance do agente, não um
 	// arquivo), mas precisa ser reconhecida como ferramenta válida.
@@ -163,7 +218,30 @@ func (s *Server) Handle(ctx context.Context, requests []Request) ([]Result, erro
 
 	results := make([]Result, 0, len(requests))
 
-	for _, req := range requests {
+	// Subagentes pedidos no mesmo lote rodam em paralelo (cada um é só leitura
+	// e conversa com o modelo, não mexe em disco): é o ganho de delegar. O
+	// resto continua em ordem, que é o contrato das operações de arquivo.
+	sub := map[int]chan Result{}
+	for i, req := range requests {
+		if aliases[strings.ToLower(strings.TrimSpace(req.Tool))] == "subagent" {
+			ch := make(chan Result, 1)
+			sub[i] = ch
+			go func(r Request) {
+				defer func() {
+					if p := recover(); p != nil {
+						ch <- Result{Tool: r.Tool, Status: "error", Error: fmt.Sprintf("o subagente falhou por um erro interno: %v", p)}
+					}
+				}()
+				ch <- s.subagente(ctx, r)
+			}(req)
+		}
+	}
+
+	for i, req := range requests {
+		if ch, ok := sub[i]; ok {
+			results = append(results, <-ch)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			results = append(results, Result{
 				Tool:   req.Tool,
@@ -187,16 +265,28 @@ func (s *Server) Handle(ctx context.Context, requests []Request) ([]Result, erro
 	return results, nil
 }
 
-func (s *Server) dispatch(req Request) Result {
+// dispatch roda a ferramenta e nunca deixa um panic dela derrubar o Amazzo: um
+// pedido malformado do modelo vira um resultado de erro que ele pode corrigir.
+func (s *Server) dispatch(req Request) (res Result) {
+	defer func() {
+		if r := recover(); r != nil {
+			res = Result{Tool: req.Tool, Path: req.Path, Status: "error",
+				Error: fmt.Sprintf("erro interno ao executar %s: %v", req.Tool, r)}
+		}
+	}()
+	return s.dispatchSeguro(req)
+}
+
+func (s *Server) dispatchSeguro(req Request) Result {
 	switch aliases[strings.ToLower(strings.TrimSpace(req.Tool))] {
 	case "read_file":
 		return s.readFile(req)
 	case "write_file":
-		return s.writeFile(req, false)
+		return s.comChecagem(req, s.writeFile(req, false))
 	case "append_file":
-		return s.writeFile(req, true)
+		return s.comChecagem(req, s.writeFile(req, true))
 	case "edit_file":
-		return s.editFile(req)
+		return s.comChecagem(req, s.editFile(req))
 	case "delete_file":
 		return s.deleteFile(req)
 	case "list_dir":
@@ -215,6 +305,12 @@ func (s *Server) dispatch(req Request) Result {
 		return s.webFetch(req)
 	case "web_search":
 		return s.webSearch(req)
+	case "job_list":
+		return s.jobList(req)
+	case "job_output":
+		return s.jobOutput(req)
+	case "job_stop":
+		return s.jobStop(req)
 	default:
 		return Result{
 			Tool:   req.Tool,
@@ -351,6 +447,11 @@ func (s *Server) readFile(req Request) Result {
 			return Result{Tool: req.Tool, Path: req.Path, Status: "error",
 				Error: fmt.Sprintf("%s tem só %d linhas; start_line=%d está além do fim.", req.Path, total, ini)}
 		}
+		// end_line antes de start_line (o modelo trocou os dois, ou pediu "259
+		// até 120"): lê o intervalo invertido em vez de quebrar.
+		if fim < ini {
+			ini, fim = fim, ini
+		}
 		texto = fmt.Sprintf("[linhas %d-%d de %d]\n%s", ini, fim, total, strings.Join(linhas[ini-1:fim], "\n"))
 	}
 
@@ -394,6 +495,12 @@ func (s *Server) writeFile(req Request, append bool) Result {
 
 	_, _, errExiste := s.fs.FileInfo(req.Path)
 	existia := errExiste == nil
+	antigo := ""
+	if existia {
+		if b, e := s.fs.ReadFile(req.Path); e == nil {
+			antigo = string(b)
+		}
+	}
 
 	path, err := s.fs.WriteFile(req.Path, []byte(conteudo), append)
 	if err != nil {
@@ -407,11 +514,23 @@ func (s *Server) writeFile(req Request, append bool) Result {
 	case existia:
 		label = "sobrescrito (o conteúdo antigo foi substituído)"
 	}
+	final := conteudo
+	if append {
+		final = antigo + conteudo
+	}
+	nLinhas := contaLinhas(final)
+	novo := conteudo
+	if append {
+		antigo = ""
+	}
 	return Result{
 		Tool:    req.Tool,
 		Path:    req.Path,
 		Status:  "success",
-		Content: fmt.Sprintf("%s %s em %s%s", req.Path, label, path, nota),
+		Content: fmt.Sprintf("%s %s em %s (%d linhas, %d bytes)%s", req.Path, label, path, nLinhas, len(final), nota),
+		Preview: diffDeLinhas(antigo, novo, 14),
+		Lines:   nLinhas,
+		Bytes:   len(final),
 	}
 }
 
@@ -513,7 +632,11 @@ func (s *Server) editFile(req Request) Result {
 		}
 	}
 
+	linhaDoSearch := s.linhaDe(req.Path, req.Search)
 	message, err := s.fs.EditFile(req.Path, req.Search, req.Replace)
+	if err == nil {
+		return s.resultadoDeEdicao(req, message, req.Search, req.Replace, linhaDoSearch)
+	}
 
 	// Modelo pequeno erra o escape do JSON com frequencia: manda "\\n" (barra
 	// invertida + n) onde queria uma quebra de linha real. Medido com o
@@ -525,15 +648,11 @@ func (s *Server) editFile(req Request) Result {
 	// interpretamos os escapes -- assim nenhum caso que funcionava se quebra.
 	if err != nil {
 		if alt := desescapa(req.Search); alt != req.Search {
+			linhaAlt := s.linhaDe(req.Path, alt)
 			if msgAlt, errAlt := s.fs.EditFile(req.Path, alt, desescapa(req.Replace)); errAlt == nil {
-				return Result{
-					Tool:   req.Tool,
-					Path:   req.Path,
-					Status: "success",
-					Content: fmt.Sprintf("Arquivo editado: %s "+
-						"(o `search` vinha com \\n literal em vez de quebra de linha; "+
-						"interpretei os escapes)", msgAlt),
-				}
+				r := s.resultadoDeEdicao(req, msgAlt, alt, desescapa(req.Replace), linhaAlt)
+				r.Content += " (o `search` vinha com \\n literal em vez de quebra de linha; interpretei os escapes)"
+				return r
 			}
 		}
 
@@ -548,11 +667,46 @@ func (s *Server) editFile(req Request) Result {
 		return Result{Tool: req.Tool, Path: req.Path, Status: "error", Error: erro}
 	}
 
+	return s.resultadoDeEdicao(req, message, req.Search, req.Replace, linhaDoSearch)
+}
+
+// resultadoDeEdicao monta o resultado de um edit_file bem-sucedido: o modelo
+// recebe o trecho já alterado com numeração de linhas (ele vê o resultado em
+// vez de supor), e o usuário recebe o diff.
+// linhaDe devolve a linha (1-based) onde `trecho` aparece no arquivo, ou 0.
+func (s *Server) linhaDe(path, trecho string) int {
+	b, err := s.fs.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	i := strings.Index(string(b), trecho)
+	if i < 0 {
+		return 0
+	}
+	return strings.Count(string(b)[:i], "\n") + 1
+}
+
+func (s *Server) resultadoDeEdicao(req Request, message, search, replace string, linha int) Result {
+	total, bytes := 0, 0
+	contexto := ""
+	if b, e := s.fs.ReadFile(req.Path); e == nil {
+		texto := string(b)
+		total, bytes = contaLinhas(texto), len(texto)
+		// A linha vem do arquivo ANTES da edicao: procurar o texto novo no
+		// arquivo achava a primeira ocorrencia dele, que podia ser outra regiao.
+		if replace != "" && linha > 0 {
+			fim := linha + strings.Count(replace, "\n")
+			contexto = "\n" + trechoNumerado(texto, linha-2, fim+2)
+		}
+	}
 	return Result{
 		Tool:    req.Tool,
 		Path:    req.Path,
 		Status:  "success",
-		Content: fmt.Sprintf("Arquivo editado: %s", message),
+		Content: fmt.Sprintf("Arquivo editado: %s (%s agora tem %d linhas)%s", message, req.Path, total, contexto),
+		Preview: diffDeLinhas(search, replace, 14),
+		Lines:   total,
+		Bytes:   bytes,
 	}
 }
 
@@ -915,17 +1069,21 @@ func (s *Server) executeCommandCtx(ctx context.Context, req Request) Result {
 		return Result{Tool: req.Tool, Status: "error", Error: fmt.Sprintf("Comando falhou: %v", err)}
 	}
 
+	job := novoJob(command, cmd.Process.Pid, logPath)
 	done := make(chan error, 1)
 	go func() {
 		e := cmd.Wait()
 		logFile.Close()
+		job.termina(e)
 		done <- e
 	}()
 
 	var waitErr error
 	select {
 	case waitErr = <-done:
+		job.esquece()
 	case <-ctx.Done():
+		job.esquece()
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		return Result{Tool: req.Tool, Status: "error", Error: "comando interrompido pelo usuário",
 			Content: lerFimDoLog(logPath, 4000)}
@@ -934,13 +1092,15 @@ func (s *Server) executeCommandCtx(ctx context.Context, req Request) Result {
 		if trecho == "" {
 			trecho = "(ainda sem saída)"
 		}
+		job.marcaSegundoPlano()
 		return Result{
 			Tool:   req.Tool,
 			Status: "success",
-			Content: fmt.Sprintf("O comando continua rodando em segundo plano (pid %d), depois de %s.\n"+
+			Content: fmt.Sprintf("O comando continua rodando em segundo plano (job #%d, pid %d), depois de %s.\n"+
 				"Saída até agora:\n%s\n\n"+
-				"Para ver mais: execute_command com `tail -n 50 %s`. Para parar: `kill -- -%d`.",
-				cmd.Process.Pid, limite, trecho, logPath, cmd.Process.Pid),
+				"Você pode continuar trabalhando. Para ver a saída depois: job_output(job_id=%d). "+
+				"Para listar: job_list. Para parar: job_stop(job_id=%d). O usuário é avisado quando terminar.",
+				job.ID, cmd.Process.Pid, limite, trecho, job.ID, job.ID),
 		}
 	}
 
@@ -1047,76 +1207,10 @@ func (s *Server) moveFile(req Request) Result {
 // webFetch busca conteúdo de uma URL.
 func (s *Server) webFetch(req Request) Result {
 	if strings.TrimSpace(req.URL) == "" {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  "web_fetch requer `url`",
-		}
+		return Result{Tool: req.Tool, Status: "error", Error: "web_fetch requer `url`"}
 	}
-
-	// Cria requisição HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, req.URL, nil)
-	if err != nil {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  fmt.Sprintf("erro ao criar requisição: %v", err),
-		}
-	}
-
-	// User-Agent para evitar bloqueios
-	httpReq.Header.Set("User-Agent", "Mozilla/5.0 (compatible; AmazzoBot/1.0)")
-	httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	// Faz a requisição
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  fmt.Sprintf("erro ao buscar URL: %v", err),
-		}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status),
-		}
-	}
-
-	// Lê o conteúdo (limitado a 500KB para evitar overflow)
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  fmt.Sprintf("erro ao ler resposta: %v", err),
-		}
-	}
-
-	// Sanitiza HTML removendo tags, scripts, etc
-	cleanContent := sanitizeHTML(string(body))
-
-	// Limita tamanho para não poluir a tela (máximo 15000 caracteres)
-	if len(cleanContent) > 15000 {
-		cleanContent = cleanContent[:15000] + "\n\n... [conteúdo truncado para caber na resposta - total original: " +
-			fmt.Sprintf("%d caracteres]", len(cleanContent))
-	}
-
-	return Result{
-		Tool:    req.Tool,
-		Status:  "success",
-		Content: fmt.Sprintf("📄 Conteúdo de: %s\n\n%s", req.URL, cleanContent),
-	}
+	req.URL = urlDeConteudo(strings.TrimSpace(req.URL))
+	return paginaWeb(req)
 }
 
 // sanitizeHTML remove tags HTML, scripts e limpa o conteúdo
@@ -1156,39 +1250,9 @@ func sanitizeHTML(html string) string {
 	return strings.TrimSpace(text)
 }
 
-// webSearch realiza uma busca na web (simulada por enquanto, pode integrar com API real).
+// webSearch pesquisa na web (DuckDuckGo, sem chave e sem custo). Ver websearch.go.
 func (s *Server) webSearch(req Request) Result {
-	if strings.TrimSpace(req.Query) == "" {
-		return Result{
-			Tool:   req.Tool,
-			Status: "error",
-			Error:  "web_search requer `query`",
-		}
-	}
-
-	// Por enquanto, retorna uma mensagem explicativa
-	// Você pode integrar com APIs como DuckDuckGo, Google Custom Search, etc.
-	return Result{
-		Tool:   req.Tool,
-		Status: "info",
-		Content: fmt.Sprintf(`Busca web por: "%s"
-
-⚠️  Web search direto ainda não implementado.
-
-Alternativas:
-1. Use web_fetch com URL específica:
-   {"tool": "web_fetch", "url": "https://exemplo.com"}
-
-2. Peça ao usuário para fornecer links específicos
-
-3. Integração futura com:
-   - DuckDuckGo API
-   - Google Custom Search
-   - SearXNG
-   - Brave Search API
-
-Para agora, recomende URLs conhecidas ou peça ao usuário os links.`, req.Query),
-	}
+	return pesquisaWeb(req)
 }
 
 const (
@@ -1263,5 +1327,5 @@ func lerFimDoLog(path string, max int64) string {
 		f.Seek(info.Size()-max, 0)
 	}
 	b, _ := io.ReadAll(f)
-	return string(b)
+	return LimpaSaida(string(b))
 }

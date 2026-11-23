@@ -338,12 +338,21 @@ func textoDosSchemas() string {
 // mcp/ -- ele parafraseava o JSON; como "tool" devolveu as 30 na ordem exata,
 // e ainda com 54 tokens de prompt a menos.
 func mensagensDeFerramenta(resultados []mcp.Result) []agents.Message {
-	msgs := make([]agents.Message, 0, len(resultados))
-
 	// Orcamento do lote inteiro: um quarto da janela. O resto e para o system
 	// prompt, os schemas, a conversa e a resposta.
-	orcamento := agents.DefaultOllamaOptions().NumCtx / 4
-	if n := len(resultados); n > 1 {
+	return mensagensDeFerramentaComOrcamento(resultados, agents.DefaultOllamaOptions().NumCtx/4)
+}
+
+// orcamentoRemotoPorResultado e o teto de um resultado para modelo de nuvem:
+// as janelas la sao de centenas de milhares de tokens. Usar o orcamento do
+// Ollama local (~3 mil tokens divididos pelo lote) cortava cada arquivo lido e
+// fazia o modelo reler os mesmos arquivos em ciclo.
+const orcamentoRemotoPorResultado = 40000
+
+func mensagensDeFerramentaComOrcamento(resultados []mcp.Result, orcamento int) []agents.Message {
+	msgs := make([]agents.Message, 0, len(resultados))
+
+	if n := len(resultados); n > 1 && orcamento < orcamentoRemotoPorResultado {
 		orcamento /= n
 	}
 

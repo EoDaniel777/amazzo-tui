@@ -8,6 +8,7 @@ import (
 	"amazzo/agents"
 	"amazzo/filesystem"
 	"amazzo/mcp"
+	"amazzo/permissions"
 )
 
 // O parser de texto e a rede de segurança para quando o modelo não usa o canal
@@ -142,8 +143,8 @@ func TestErroDeFerramentaChegaAoModelo(t *testing.T) {
 // verdade: aqui interessa só como a resposta vazia é classificada.
 func TestRespostaSoComToolCallsNaoContaComoVazia(t *testing.T) {
 	m := novoModelDeTeste(t)
+	ferramentasDeTeste(t, m)
 	m.conversationHistory = []agents.Message{{Role: "system", Content: "sys"}}
-	m.toolRuns = 15
 	m.lastToolCalls = []agents.ToolCall{{
 		Function: agents.ToolCallFunction{
 			Name:      "list_dir",
@@ -167,8 +168,8 @@ func TestRespostaSoComToolCallsNaoContaComoVazia(t *testing.T) {
 // como texto: é o que faz o template de chat abrir um turno de ferramenta.
 func TestChamadaNativaEntraNoHistoricoComoToolCalls(t *testing.T) {
 	m := novoModelDeTeste(t)
+	ferramentasDeTeste(t, m)
 	m.conversationHistory = []agents.Message{{Role: "system", Content: "sys"}}
-	m.toolRuns = 15
 	m.lastToolCalls = []agents.ToolCall{{
 		Function: agents.ToolCallFunction{
 			Name:      "list_dir",
@@ -560,8 +561,8 @@ func TestRepeticaoDetectadaComCaminhoEquivalente(t *testing.T) {
 // servidor — imune a qualquer atraso do laço de eventos.
 func TestTempoDoRaciocinioVemDasMetricasDoOllama(t *testing.T) {
 	m := novoModelDeTeste(t)
+	ferramentasDeTeste(t, m)
 	m.conversationHistory = []agents.Message{{Role: "system", Content: "sys"}}
-	m.toolRuns = 15 // não dispara o laço de ferramentas
 	// Relógio da UI muito atrás: é o cenário que produziu os 116 minutos.
 	m.streamStart = time.Now().Add(-2 * time.Hour)
 	m.streamThinking = "raciocínio"
@@ -579,8 +580,8 @@ func TestTempoDoRaciocinioVemDasMetricasDoOllama(t *testing.T) {
 // Sem métricas do Ollama o relógio da UI ainda é melhor que nada.
 func TestSemMetricasUsaORelogioComoReserva(t *testing.T) {
 	m := novoModelDeTeste(t)
+	ferramentasDeTeste(t, m)
 	m.conversationHistory = []agents.Message{{Role: "system", Content: "sys"}}
-	m.toolRuns = 15
 	m.streamStart = time.Now().Add(-5 * time.Second)
 
 	m.Update(ollamaDoneMsg{full: "resposta", stats: agents.OllamaStats{}})
@@ -588,4 +589,21 @@ func TestSemMetricasUsaORelogioComoReserva(t *testing.T) {
 	if m.lastThinkingTime < 4*time.Second || m.lastThinkingTime > 30*time.Second {
 		t.Errorf("reserva do relógio fora do esperado: %v", m.lastThinkingTime)
 	}
+}
+
+// ferramentasDeTeste dá ao Model o que o laço de ferramentas precisa, em uma
+// pasta e um HOME temporários. Sem limite de ciclos, uma resposta com
+// tool_calls entra de verdade no laço.
+func ferramentasDeTeste(t *testing.T, m *Model) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	pm, err := permissions.NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, err := filesystem.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.permManager, m.fsManager, m.mcpServer = pm, fm, mcp.NewServer(fm)
 }

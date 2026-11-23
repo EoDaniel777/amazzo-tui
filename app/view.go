@@ -129,6 +129,9 @@ func (m *Model) chatView() string {
 		m.viewport.Width = contentWidth
 		m.viewport.Height = viewportHeight
 	}
+	// A altura muda a cada quadro (previa do streaming): sem recolar no fim, o
+	// conteudo novo ficava abaixo da tela e voce via a mensagem antiga.
+	m.colaNoFim()
 
 	// ========== HEADER ==========
 	workspace := filepath.Base(m.workspaceRoot)
@@ -157,7 +160,7 @@ func (m *Model) chatView() string {
 		}
 		// Fora do fim da conversa, dizer onde você está evita a impressão de
 		// que a resposta acabou ali.
-		if !m.viewport.AtBottom() {
+		if m.soltouFim {
 			meta = fmt.Sprintf("▲ %.0f%% · %s", m.viewport.ScrollPercent()*100, meta)
 		}
 		header = renderStatusBar(availableModels[m.currentModel].DisplayName,

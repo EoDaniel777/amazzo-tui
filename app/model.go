@@ -195,6 +195,21 @@ type Model struct {
 
 	toolRuns int
 
+	// Entrega pedida: o pedido atual do usuario exige criar/editar arquivo, e
+	// ainda nao houve escrita. Ver garantiaDeEntrega.
+	// soltouFim e verdadeiro quando VOCE rolou para cima de proposito. Enquanto
+	// falso, a conversa acompanha o fim sozinha. Nao se deduz de AtBottom():
+	// o View() muda a altura da area a cada quadro (a previa do streaming
+	// cresce e some) e AtBottom passava a dar falso sem ninguem ter rolado.
+	soltouFim bool
+
+	// modelosSemTools: provedores que recusaram o campo "tools" nesta sessao.
+	modelosSemTools map[string]bool
+
+	pedidoAtual  string
+	escreveuArq  bool
+	cobrancasArq int
+
 	// Contadores de tokens
 	inputTokens  int
 	outputTokens int
@@ -262,9 +277,15 @@ type Model struct {
 }
 
 type apiResponseMsg struct {
-	response     string
-	err          error
-	wasTruncated bool
+	response  string
+	toolCalls []agents.ToolCall
+
+	// Devolvidos pela goroutine para o Update aplicar no Model.
+	promptTokens, completionTokens int
+	modelo                         string
+	semTools                       bool
+	err                            error
+	wasTruncated                   bool
 }
 
 type tickMsg time.Time
@@ -737,7 +758,7 @@ func (m *Model) addMessage(msg string) {
 	// Se o usuário subiu para reler, mensagem nova não pode puxá-lo de volta
 	// para o fim no meio da leitura. Acompanhar sozinho só faz sentido para
 	// quem já está no fim.
-	acompanhando := m.viewport.AtBottom()
+	acompanhando := m.segue()
 
 	wrapped := wrapText(msg, m.viewport.Width)
 	m.messages = append(m.messages, wrapped)
@@ -904,10 +925,12 @@ func (m *Model) interceptKey(msg tea.KeyMsg) bool {
 
 	case tea.KeyHome:
 		m.viewport.GotoTop()
+		m.soltouFim = true
 		return true
 
 	case tea.KeyEnd:
 		m.viewport.GotoBottom()
+		m.soltouFim = false
 		return true
 
 	case tea.KeyUp:
@@ -915,6 +938,7 @@ func (m *Model) interceptKey(msg tea.KeyMsg) bool {
 			// Alt+Up = scroll viewport
 			if m.viewport.YOffset > 0 {
 				m.viewport.LineUp(1)
+				m.soltouFim = true
 			}
 			return true
 		}
@@ -933,6 +957,7 @@ func (m *Model) interceptKey(msg tea.KeyMsg) bool {
 			if m.viewport.YOffset < m.viewport.TotalLineCount()-m.viewport.VisibleLineCount() {
 				m.viewport.LineDown(1)
 			}
+			m.soltouFim = !m.viewport.AtBottom()
 			return true
 		}
 		// Down sozinho = deixa o textarea processar
@@ -1302,6 +1327,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case clockTickMsg:
 		m.onClockTick(time.Time(msg))
+		m.avisaJobsConcluidos()
 		// Como um "source ~/.bashrc": mexeu na configuração, vale já.
 		if m.mcpMgr != nil && !m.loading && !m.mcpReloading && m.mcpMgr.Changed() {
 			m.pendingCmd = tea.Batch(m.pendingCmd, m.reloadMCP(true))
@@ -1545,6 +1571,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.startTask()
 			m.loading = true
+			m.soltouFim = false
+			m.viewport.GotoBottom()
+			m.pedidoAtual = processedInput
+			m.escreveuArq = false
+			m.cobrancasArq = 0
 
 			return m, tea.Batch(
 				tiCmd,
@@ -1566,6 +1597,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case tea.KeyCtrlR:
+			m.chamadasFeitas = nil
 			// Resetar conversa completamente
 			m.messages = []string{}
 			m.viewport.SetContent("")
@@ -1584,6 +1616,11 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Mouse wheel sempre controla o viewport
 		if msg.Type == tea.MouseWheelUp || msg.Type == tea.MouseWheelDown {
 			m.viewport, vpCmd = m.viewport.Update(msg)
+			if msg.Type == tea.MouseWheelUp {
+				m.soltouFim = true
+			} else {
+				m.soltouFim = !m.viewport.AtBottom()
+			}
 			return m, tea.Batch(tiCmd, vpCmd)
 		}
 		// Outros eventos de mouse são ignorados
@@ -1641,6 +1678,7 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case apiResponseMsg:
 		m.loading = false
+		m.cancelFunc = nil
 		m.removePlaceholders()
 
 		var nextCmd tea.Cmd
@@ -1655,6 +1693,18 @@ func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}.render())
 			m.addMessage("")
 		} else {
+			if msg.toolCalls != nil {
+				m.lastToolCalls = msg.toolCalls
+			}
+			if msg.promptTokens > 0 {
+				m.inputTokens, m.outputTokens = msg.promptTokens, msg.completionTokens
+			}
+			if msg.semTools {
+				if m.modelosSemTools == nil {
+					m.modelosSemTools = map[string]bool{}
+				}
+				m.modelosSemTools[msg.modelo] = true
+			}
 			nextCmd = m.handleAIResponse(msg.response)
 
 			// Se foi truncada e ainda há ciclos disponíveis, continua automaticamente
@@ -1729,6 +1779,7 @@ func (m *Model) setGlamourWidth(width int) {
 // Por isso trocamos cada bloco por um marcador de uma palavra, renderizamos o
 // markdown, e so entao devolvemos os blocos no lugar dos marcadores.
 func (m *Model) renderMarkdown(text string) string {
+	text = limpaTexto(text)
 	todoBlockRegex := regexp.MustCompile("(?s)```todo[ \t]*\r?\n(.*?)```")
 
 	var blocks []string
@@ -1988,89 +2039,89 @@ func (m *Model) callAPI(input string) tea.Cmd {
 		return func() tea.Msg { return apiResponseMsg{err: err} }
 	}
 
+	// Tudo que le ou grava estado do Model acontece AQUI, no laco de eventos.
+	// A closure abaixo roda em outra goroutine e so recebe valores prontos:
+	// mexer no Model de la competia com Ctrl+R e com o Update.
+	modelConfig := availableModels[m.currentModel]
+	modelName := modelConfig.Endpoint
+	alvoURL, alvoToken, errAlvo := m.remoteTarget(modelConfig)
+	if errAlvo != nil {
+		return func() tea.Msg { return apiResponseMsg{err: errAlvo} }
+	}
+
+	m.conversationHistory = append(m.conversationHistory, agents.Message{Role: "user", Content: input})
+	m.inputTokens += estimateTokens(input)
+	m.metrics.RecordCacheMiss() // sem cache de resposta: ver historico do git
+
+	// Por tamanho, nao por contagem: 40 mensagens eram ~13 rodadas de
+	// ferramenta, e o modelo esquecia o que ja tinha lido e lia de novo.
+	trimmed := trimHistoryPorTamanho(m.conversationHistory, 600000)
+	if len(trimmed) != len(m.conversationHistory) {
+		m.conversationHistory = append([]agents.Message(nil), trimmed...)
+		// O que foi cortado nao esta mais no contexto: reler deixa de ser
+		// repeticao.
+		m.chamadasFeitas = nil
+	}
+
+	contexto := contextoDoProjeto(m.workspaceRoot)
+	comContexto := func(w []wireMessage) []wireMessage {
+		if len(w) > 0 && w[0].Role == "system" && w[0].Content != nil {
+			w[0].Content = strPtr(*w[0].Content + contexto)
+		}
+		return w
+	}
+
+	request := wireRequest{
+		Model:       modelName,
+		Messages:    comContexto(mensagensParaAPI(trimmed)),
+		Tools:       m.toolSchemas(),
+		Stream:      false,
+		MaxTokens:   16384,
+		Temperature: 0.3,
+	}
+	// Provedor que ja recusou "tools" nesta sessao: vai direto em texto.
+	if m.modelosSemTools[modelName] {
+		request.Tools = nil
+		request.Messages = nil
+	}
+	var textoWire []wireMessage
+	for _, am := range achataMensagensDeFerramenta(trimmed) {
+		textoWire = append(textoWire, wireMessage{Role: am.Role, Content: strPtr(am.Content)})
+	}
+	textoWire = comContexto(textoWire)
+	if request.Messages == nil {
+		request.Messages = textoWire
+	}
+
+	debug := m.debugMode
+	metrics := m.metrics
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	m.cancelFunc = cancel
+	if m.mcpServer != nil {
+		m.mcpServer.DefineDelegar(delegadoParaSubagente(m.mcpServer, alvoURL, alvoToken, modelName, contexto))
+	}
+
 	return func() tea.Msg {
+		defer cancel()
 		startTime := time.Now()
-		modelConfig := availableModels[m.currentModel]
-		modelName := modelConfig.Endpoint
 
-		// Sempre adiciona a mensagem do usuário ao histórico primeiro
-		m.conversationHistory = append(m.conversationHistory, agents.Message{
-			Role:    "user",
-			Content: input,
-		})
-
-		// Conta tokens de entrada
-		inputTokenCount := estimateTokens(input)
-		m.inputTokens += inputTokenCount
-
-		// Verificar cache primeiro (apenas para modelos HF)
-		if cachedResponse, found := m.cache.Get(input, modelName); found {
-			m.metrics.RecordCacheHit()
-			if m.debugMode {
-				fmt.Fprintf(os.Stderr, "[DEBUG] Cache HIT para modelo %s\n", modelName)
-			}
-			return apiResponseMsg{response: cachedResponse}
-		}
-		m.metrics.RecordCacheMiss()
-
-		trimmed := trimHistory(m.conversationHistory, 40) // Aumentado de 24 para 40 para mais contexto
-		if len(trimmed) != len(m.conversationHistory) {
-			m.conversationHistory = append([]agents.Message(nil), trimmed...)
-		}
-
-		// O historico guarda os turnos de ferramenta no formato nativo, que e o
-		// que o Ollama entende. A API do Hugging Face nao aceita esse formato,
-		// entao a traducao para texto acontece so na hora de enviar -- assim ha
-		// uma unica representacao no historico.
-		trimmed = achataMensagensDeFerramenta(trimmed)
-
-		request := ChatCompletionRequest{
-			Model:       modelName,
-			Messages:    trimmed,
-			Stream:      false,
-			MaxTokens:   16384, // 16k tokens - máximo para evitar truncamento
-			Temperature: 0.7,
-			TopP:        0.9,
-		}
-
-		// Validar requisição
-		if err := validateRequest(request); err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			return apiResponseMsg{err: fmt.Errorf("requisição inválida: %w", err)}
+		if modelName == "" || len(request.Messages) == 0 {
+			metrics.RecordRequest(time.Since(startTime), false, 0)
+			return apiResponseMsg{err: fmt.Errorf("requisição inválida: modelo ou mensagens vazios")}
 		}
 
 		requestBody, err := json.Marshal(request)
 		if err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
+			metrics.RecordRequest(time.Since(startTime), false, 0)
 			return apiResponseMsg{err: fmt.Errorf("erro ao converter requisição: %w", err)}
 		}
 
 		// Log de debug
-		if m.debugMode {
+		if debug {
 			fmt.Fprintf(os.Stderr, "[DEBUG] REQUEST:\n%s\n", string(requestBody))
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second) // 5 minutos
-		m.cancelFunc = cancel
-		defer func() {
-			m.cancelFunc = nil
-		}()
-
-		alvoURL, alvoToken, err := m.remoteTarget(modelConfig)
-		if err != nil {
-			return apiResponseMsg{err: err}
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, alvoURL, strings.NewReader(string(requestBody)))
-		if err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			return apiResponseMsg{err: fmt.Errorf("erro ao criar requisição: %w", err)}
-		}
-
-		req.Header.Set("Authorization", "Bearer "+alvoToken)
-		req.Header.Set("Content-Type", "application/json")
-
-		// Cliente HTTP otimizado - FORÇA HTTP/1.1 (HTTP/2 causa timeouts)
-		// Configuração agressiva para garantir HTTP/1.1
+		// Cliente HTTP - FORÇA HTTP/1.1 (HTTP/2 causa timeouts)
 		transport := &http.Transport{
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   10,
@@ -2078,78 +2129,163 @@ func (m *Model) callAPI(input string) tea.Cmd {
 			ResponseHeaderTimeout: 120 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			TLSHandshakeTimeout:   15 * time.Second,
-			DisableKeepAlives:     false,
 			ForceAttemptHTTP2:     false,
-			TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper), // BLOQUEIA HTTP/2
+			TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+		}
+		client := &http.Client{Timeout: 300 * time.Second, Transport: transport}
+
+		enviar := func(corpo []byte) (int, []byte, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, alvoURL, strings.NewReader(string(corpo)))
+			if err != nil {
+				return 0, nil, fmt.Errorf("erro ao criar requisição: %w", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+alvoToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := client.Do(req)
+			if err != nil {
+				return 0, nil, fmt.Errorf("erro ao fazer requisição: %w", err)
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return 0, nil, fmt.Errorf("erro ao ler resposta: %w", err)
+			}
+			return resp.StatusCode, b, nil
 		}
 
-		client := &http.Client{
-			Timeout:   300 * time.Second,
-			Transport: transport,
-		}
-		resp, err := client.Do(req)
+		semTools := false
+		status, body, err := enviar(requestBody)
 		if err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			return apiResponseMsg{err: fmt.Errorf("erro ao fazer requisição: %w", err)}
-		}
-		defer resp.Body.Close()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			return apiResponseMsg{err: fmt.Errorf("erro ao ler resposta: %w", err)}
+			metrics.RecordRequest(time.Since(startTime), false, 0)
+			return apiResponseMsg{err: err}
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			errorMsg := cleanAPIError(resp.StatusCode, string(body))
+		// Provedor que nao aceita "tools": reenvia com o historico em texto
+		// (o modelo volta a pedir ferramentas por JSON, que o parser entende).
+		if (status == http.StatusBadRequest || status == http.StatusUnprocessableEntity) &&
+			len(request.Tools) > 0 && strings.Contains(strings.ToLower(string(body)), "tool") {
+			request.Tools = nil
+			request.Messages = textoWire
+			semTools = true
+			if corpo, merr := json.Marshal(request); merr == nil {
+				status, body, err = enviar(corpo)
+				if err != nil {
+					metrics.RecordRequest(time.Since(startTime), false, 0)
+					return apiResponseMsg{err: err}
+				}
+			}
+		}
+
+		if status != http.StatusOK {
+			metrics.RecordRequest(time.Since(startTime), false, 0)
+			errorMsg := cleanAPIError(status, string(body))
 			return apiResponseMsg{err: fmt.Errorf("%s", errorMsg)}
 		}
 
 		// Log de debug
-		if m.debugMode {
+		if debug {
 			fmt.Fprintf(os.Stderr, "[DEBUG] RESPONSE:\n%s\n", string(body))
 		}
 
-		var completionResp ChatCompletionResponse
+		var completionResp wireResponse
 		if err := json.Unmarshal(body, &completionResp); err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
+			metrics.RecordRequest(time.Since(startTime), false, 0)
 			return apiResponseMsg{err: fmt.Errorf("erro ao parsear resposta: %w", err)}
 		}
 
-		// Validar resposta
-		if err := validateAPIResponse(completionResp); err != nil {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
-			return apiResponseMsg{err: err}
-		}
-
 		if len(completionResp.Choices) == 0 {
-			m.metrics.RecordRequest(time.Since(startTime), false, 0)
+			metrics.RecordRequest(time.Since(startTime), false, 0)
 			return apiResponseMsg{err: fmt.Errorf("nenhuma resposta recebida da API")}
 		}
 
-		response := completionResp.Choices[0].Message.Content
-		finishReason := completionResp.Choices[0].FinishReason
+		choice := completionResp.Choices[0]
+		if choice.FinishReason == "content_filter" {
+			metrics.RecordRequest(time.Since(startTime), false, 0)
+			return apiResponseMsg{err: fmt.Errorf("resposta bloqueada pelo filtro de conteúdo da API")}
+		}
 
-		// Atualizar tokens com dados reais da API se disponíveis
+		response := cortaSaidaInventada(choice.Message.Content)
+
+		var chamadas []agents.ToolCall
+		for _, tc := range choice.Message.ToolCalls {
+			if tc.Function.Name == "" {
+				continue
+			}
+			chamadas = append(chamadas, agents.ToolCall{
+				ID: tc.ID,
+				Function: agents.ToolCallFunction{
+					Name:      tc.Function.Name,
+					Arguments: argumentosDaChamada(tc.Function.Arguments),
+				},
+			})
+		}
+
+		promptTokens, completionTokens := 0, 0
+		// Tokens reais da API; quem aplica no Model e o Update.
 		tokensUsed := estimateTokens(response)
 		if completionResp.Usage.TotalTokens > 0 {
 			tokensUsed = completionResp.Usage.TotalTokens
-			// Atualizar contadores com dados precisos da API
-			m.inputTokens = completionResp.Usage.PromptTokens
-			m.outputTokens = completionResp.Usage.CompletionTokens
+			promptTokens = completionResp.Usage.PromptTokens
+			completionTokens = completionResp.Usage.CompletionTokens
 		}
 
-		// Registrar métricas
-		m.metrics.RecordRequest(time.Since(startTime), true, tokensUsed)
+		metrics.RecordRequest(time.Since(startTime), true, tokensUsed)
 
-		// Armazenar no cache (apenas se completo)
-		if finishReason == "stop" || finishReason == "" {
-			m.cache.Set(input, modelName, response)
-		}
-
-		return apiResponseMsg{response: response, wasTruncated: finishReason == "length"}
+		return apiResponseMsg{response: response, toolCalls: chamadas, promptTokens: promptTokens, completionTokens: completionTokens, modelo: modelName, semTools: semTools, wasTruncated: choice.FinishReason == "length" && len(chamadas) == 0}
 	}
+}
+
+// trimHistoryPorTamanho mantem o prompt de sistema, o primeiro pedido do
+// usuario e as mensagens mais recentes que couberem em maxChars (~150 mil
+// tokens). Descarta do meio, nunca o pedido original.
+func trimHistoryPorTamanho(h []agents.Message, maxChars int) []agents.Message {
+	tam := func(m agents.Message) int {
+		n := len(m.Content)
+		for _, c := range m.ToolCalls {
+			n += 100 + len(c.Function.Name)
+			for k, v := range c.Function.Arguments {
+				n += len(k) + len(fmt.Sprint(v))
+			}
+		}
+		return n
+	}
+	total := 0
+	for _, m := range h {
+		total += tam(m)
+	}
+	if total <= maxChars || len(h) < 3 {
+		return h
+	}
+	fixos := []agents.Message{h[0]}
+	resto := h[1:]
+	if len(resto) > 0 && resto[0].Role == "user" {
+		fixos = append(fixos, resto[0])
+		resto = resto[1:]
+	}
+	usado := 0
+	for _, m := range fixos {
+		usado += tam(m)
+	}
+	// A ultima mensagem sempre fica, mesmo sozinha acima do teto.
+	corte := len(resto) - 1
+	if corte < 0 {
+		return h
+	}
+	usado += tam(resto[corte])
+	for i := len(resto) - 2; i >= 0; i-- {
+		usado += tam(resto[i])
+		if usado > maxChars {
+			break
+		}
+		corte = i
+	}
+	// So corta em fronteira de rodada: um resultado de ferramenta sem a
+	// chamada que o originou nao serve de nada. Recua ate o assistant que o
+	// pediu.
+	for corte > 0 && resto[corte].Role == "tool" {
+		corte--
+	}
+	return append(append([]agents.Message(nil), fixos...), resto[corte:]...)
 }
 
 func trimHistory(history []agents.Message, maxMessages int) []agents.Message {
@@ -2269,7 +2405,7 @@ func (m *Model) handleAIResponse(response string) tea.Cmd {
 	// A chamada pode vir pelo canal nativo ou como JSON no texto. Normalizar as
 	// nativas para o mesmo formato deixa um caminho unico daqui para frente.
 	textoDasNativas := textoDasToolCalls(chamadasNativas)
-	if requests := m.parseToolRequests(response + textoDasNativas); len(requests) > 0 && m.toolRuns < 15 {
+	if requests := m.parseToolRequests(response + textoDasNativas); len(requests) > 0 {
 		m.toolRuns++
 
 		// A chamada nativa nao esta no texto da resposta, entao o
@@ -2288,8 +2424,16 @@ func (m *Model) handleAIResponse(response string) tea.Cmd {
 		return cmd
 	}
 
+	// Pediu um arquivo e o modelo está encerrando sem ter escrito nenhum:
+	// cobra a entrega em vez de aceitar "se quiser, eu crio".
+	if cobranca := m.garantiaDeEntrega(response); cobranca != "" {
+		m.loading = true
+		m.addMessage(renderNotice("↻", "Você pediu um arquivo e ele ainda não foi criado. Cobrando o modelo…", colGraphite))
+		return tea.Batch(m.spinner.Tick, m.callAPI(cobranca))
+	}
+
 	// 🚨 STOP HOOK: Verifica se há tarefas pendentes antes de parar
-	if m.toolRuns < 15 {
+	{
 		incompleteTasks := m.parseIncompleteTasks(response)
 		if len(incompleteTasks) > 0 {
 			// DETECÇÃO de LOOP: se o agente repete uma resposta recente, ele
@@ -2326,13 +2470,6 @@ Continue agora com a próxima tarefa pendente.`, strings.Join(incompleteTasks, "
 		}
 	}
 
-	// Se atingiu limite, avisa usuário
-	if m.toolRuns >= 15 {
-		m.addMessage(m.theme.InfoStyle.Render("⚠️ Limite de 15 ciclos de ferramentas atingido"))
-		m.addMessage(m.theme.HelpStyle.Render("💡 Se a tarefa não está completa, continue pedindo:"))
-		m.addMessage(m.theme.HelpStyle.Render("   'continue de onde parou' ou 'complete a tarefa'"))
-	}
-
 	m.toolRuns = 0
 	return nil
 }
@@ -2341,6 +2478,9 @@ Continue agora com a próxima tarefa pendente.`, strings.Join(incompleteTasks, "
 func (m *Model) mostraChamadasNativas(chamadas []agents.ToolCall) {
 	for _, c := range chamadas {
 		if c.Function.Name == "" {
+			continue
+		}
+		if m.chamadaJaFeita(c) {
 			continue
 		}
 		bruto, err := json.Marshal(map[string]interface{}{
@@ -2648,6 +2788,11 @@ func (m *Model) runMCPRequests(requests []mcp.Request) []mcp.Result {
 }
 
 func (m *Model) renderToolResult(res mcp.Result) {
+	// Chamada repetida com o mesmo resultado: nao ha o que mostrar. Quem
+	// avisa e a linha unica de marcaRepeticoes.
+	if res.Status == "success" && m.ehRepeticao(res) {
+		return
+	}
 	m.addRerenderable(func() string { return toolResultBlock(res, m.viewport.Width) })
 	m.addMessage("")
 }
@@ -2694,10 +2839,20 @@ func descreveAcao(req mcp.Request) string {
 	switch req.Tool {
 	case "execute_command":
 		return "rodar: " + req.Command
-	case "write_file":
-		return fmt.Sprintf("escrever %s (%d caracteres)", req.Path, len(req.Content))
+	case "write_file", "append_file":
+		verbo := "escrever"
+		if req.Tool == "append_file" {
+			verbo = "acrescentar em"
+		}
+		return fmt.Sprintf("%s %s (%d linhas, %d caracteres)%s", verbo, req.Path,
+			strings.Count(req.Content, "\n")+1, len(req.Content), previaDoPedido(req.Content, "+", 8))
 	case "edit_file":
-		return fmt.Sprintf("editar %s", req.Path)
+		return fmt.Sprintf("editar %s%s%s", req.Path,
+			previaDoPedido(req.Search, "-", 5), previaDoPedido(req.Replace, "+", 5))
+	case "subagent":
+		return "delegar a um subagente: " + limitaTexto(firstNonEmpty(req.Task, req.Query), 90)
+	case "job_output", "job_stop":
+		return fmt.Sprintf("%s do job #%d", req.Tool, req.JobID)
 	case "make_dir":
 		return "criar a pasta " + req.Path
 	case "set_workspace":
@@ -2786,7 +2941,24 @@ func (m *Model) processPendingRequests(approved bool) tea.Cmd {
 // tokens de prompt a menos.
 func (m *Model) registraResultadosDeFerramenta(resultados []mcp.Result) {
 	resultados = m.marcaRepeticoes(resultados)
-	msgs := mensagensDeFerramenta(resultados)
+	for _, r := range resultados {
+		switch strings.ToLower(r.Tool) {
+		case "write_file", "append_file", "edit_file":
+			if r.Status == "success" {
+				m.escreveuArq = true
+			}
+		}
+	}
+	var msgs []agents.Message
+	if isLocalModel(availableModels[m.currentModel]) {
+		msgs = mensagensDeFerramenta(resultados)
+	} else {
+		orc := orcamentoRemotoPorResultado
+		if n := len(resultados); n > 1 && 120000/n < orc {
+			orc = 120000 / n // teto do lote: ~120 mil tokens
+		}
+		msgs = mensagensDeFerramentaComOrcamento(resultados, orc)
+	}
 	m.conversationHistory = append(m.conversationHistory, msgs...)
 
 	for _, msg := range msgs {
@@ -2808,11 +2980,13 @@ func (m *Model) marcaRepeticoes(resultados []mcp.Result) []mcp.Result {
 	}
 
 	marcados := make([]mcp.Result, 0, len(resultados))
+	var repetidas []string
 	for _, res := range resultados {
-		// filepath.Clean normaliza o caminho: medimos o modelo chamando
-		// "list_dir ./docs" e depois "list_dir ./docs/" -- mesmo diretorio,
-		// texto diferente, e a repeticao passava batida.
-		assinatura := strings.ToLower(res.Tool) + "\x00" + filepath.Clean(res.Path)
+		assinatura := assinaturaDoResultado(res)
+		if assinatura == "" {
+			marcados = append(marcados, res)
+			continue
+		}
 		resposta := res.Status + "\x00" + res.Error + "\x00" + res.Content
 
 		if anterior, jaFez := m.chamadasFeitas[assinatura]; jaFez && anterior == resposta {
@@ -2823,15 +2997,50 @@ func (m *Model) marcaRepeticoes(resultados []mcp.Result) []mcp.Result {
 			} else {
 				res.Error = aviso + res.Error
 			}
-			m.addMessage(m.theme.HelpStyle.Render(
-				"↺ chamada repetida (" + strings.ToLower(res.Tool) + " " + res.Path + ") — avisando o modelo"))
+			repetidas = append(repetidas, strings.ToLower(res.Tool)+" "+res.Path)
 		}
 
 		m.chamadasFeitas[assinatura] = resposta
 		marcados = append(marcados, res)
 	}
 
+	// Uma linha so, em vez de um cartao por chamada repetida.
+	if len(repetidas) > 0 {
+		m.addMessage(m.theme.HelpStyle.Render("↺ usando de novo: " + strings.Join(limita(repetidas, 4), ", ") +
+			maisItens(len(repetidas), 4)))
+	}
 	return marcados
+}
+
+func maisItens(total, mostrados int) string {
+	if total > mostrados {
+		return fmt.Sprintf(" … +%d", total-mostrados)
+	}
+	return ""
+}
+
+// assinaturaDoResultado identifica uma chamada pela ferramenta e pelo alvo.
+//
+// So leitura e listagem entram: execute_command, search_files, web_fetch e as
+// ferramentas externas devolvem Path vazio, e comparar so por ferramenta tratava
+// "go build" e "go vet" como a mesma chamada. Vazio = nunca e repeticao.
+func assinaturaDoResultado(res mcp.Result) string {
+	t := strings.ToLower(res.Tool)
+	if (t != "read_file" && t != "list_dir" && t != "file_info") || strings.TrimSpace(res.Path) == "" {
+		return ""
+	}
+	return t + "\x00" + filepath.Clean(res.Path)
+}
+
+// ehRepeticao diz se este resultado e identico ao da ultima vez que a mesma
+// chamada rodou -- nesse caso nao ha nada novo para mostrar.
+func (m *Model) ehRepeticao(res mcp.Result) bool {
+	assinatura := assinaturaDoResultado(res)
+	if assinatura == "" {
+		return false
+	}
+	anterior, jaFez := m.chamadasFeitas[assinatura]
+	return jaFez && anterior == res.Status+"\x00"+res.Error+"\x00"+res.Content
 }
 
 // continuaAposFerramentas devolve o turno ao modelo com os resultados no
@@ -3090,28 +3299,66 @@ read_file. Nunca deduza o conteúdo pelo nome do arquivo.
 Não afirme que algo falta sem ter verificado: se o arquivo apareceu numa
 listagem, ele existe e não deve ser sugerido para criação. Recomende só o que
 serve para a linguagem deste projeto.
-Você nunca sai explorando o projeto por conta própria: olha só o que a pergunta
-exige. Nunca invente caminhos, nomes de arquivo ou conteúdo — o que você afirma
+Nunca invente caminhos, nomes de arquivo ou conteúdo — o que você afirma
 vem do resultado das ferramentas.
 
 ## Ferramentas
 
-Emita um bloco por vez e espere o resultado antes do próximo:
+Use as ferramentas pelo mecanismo de chamada de função (tool calls). Você pode
+pedir várias leituras independentes de uma vez, na mesma resposta.
+
+Regras que não têm exceção:
+- NUNCA escreva o resultado de uma ferramenta. Nada de "Ferramenta executada
+  com sucesso", "Saída:" ou listagens que você imagina. Quem executa e devolve
+  o resultado real é o Amazzo; pare a resposta na chamada e espere.
+- Não repita uma chamada que já fez. O resultado não muda; use o que já sabe.
+- O contexto da sessão (pasta, linguagem do projeto, conteúdo da raiz) vem
+  abaixo e é verificado. Não gaste chamadas confirmando o que já está lá.
+- Você tem liberdade para trabalhar do jeito mais curto e eficiente: peça
+  várias leituras de uma vez, use search_files, ou execute_command com
+  grep/find/wc/sed/cat/head — o que entregar o pedido mais rápido. Revisar um
+  projeto inteiro pode exigir dezenas de leituras; isso é normal e não há
+  limite de rodadas. Leia o arquivo inteiro de uma vez, sem fatiar à toa.
+- Não liste a mesma pasta nem releia o mesmo arquivo duas vezes: o que você
+  leu continua na conversa.
+- Se uma ferramenta falhar, leia o erro e corrija o caminho; não insista no
+  mesmo argumento.
+
+Só se a plataforma não aceitar chamada de função, escreva um bloco por vez:
 
 ` + "```tool" + `
 {"tool": "list_dir", "path": "."}
 ` + "```" + `
 
-Use exatamente estas chaves:
-{"tool":"read_file","path":"..."}
-{"tool":"write_file","path":"...","content":"..."}
-{"tool":"edit_file","path":"...","search":"...","replace":"..."}
-{"tool":"list_dir","path":"."}
-{"tool":"search_files","pattern":"...","path":"."}
-{"tool":"make_dir","path":"..."}
-{"tool":"execute_command","command":"go test ./..."}
-{"tool":"web_fetch","url":"https://..."}
-{"tool":"set_workspace","path":"/caminho/do/projeto"}
+Ferramentas: read_file(path), write_file(path, content), edit_file(path,
+search, replace), list_dir(path), search_files(pattern, path), make_dir(path),
+execute_command(command), web_fetch(url), set_workspace(path).
+
+## Segundo plano e subagentes
+
+- Servidor, bot ou watcher: execute_command com background=true devolve um job
+  número N na hora. Continue trabalhando; job_output(job_id) lê a saída recente,
+  job_list lista, job_stop encerra. O usuário é avisado quando o job termina.
+- subagent(task) delega uma PESQUISA (ler muitos arquivos, achar onde algo é
+  usado) a um agente que só lê e devolve a conclusão, sem encher seu contexto.
+  Vários subagent no mesmo lote rodam em paralelo: use para investigar módulos
+  independentes ao mesmo tempo. Escrever e rodar comandos continua com você.
+- Depois de write_file/edit_file em código Go o Amazzo confere a sintaxe e avisa
+  no resultado ("⚠ ATENÇÃO"). Se avisou, corrija antes de seguir ou compilar.
+
+## Criar e editar arquivos
+
+- Pediu para criar, salvar ou gerar um arquivo: chame write_file no mesmo
+  turno em que terminar a análise. Nunca encerre com "se quiser, eu crio" nem
+  cole o conteúdo no chat no lugar de gravar.
+- O caminho é relativo à pasta de trabalho ("MELHORIAS.md" fica na raiz). As
+  pastas que faltarem são criadas.
+- Editar arquivo existente: leia com read_file, depois edit_file com o trecho
+  exato. Para acrescentar ao fim use append_file. Não reescreva o arquivo
+  inteiro para mudar poucas linhas.
+- O resultado da gravação mostra o tamanho e, na edição, o trecho alterado com
+  números de linha: confira, não assuma. O usuário também vê o diff.
+- Conteúdo de arquivo é texto real, com quebras de linha de verdade.
 
 ## Pasta de trabalho
 
@@ -3228,6 +3475,21 @@ func requestDoPayload(payload string) (mcp.Request, bool) {
 				campos, desembrulhou = decodificado, true
 			}
 		}
+	}
+
+	// Modelos mandam "10" onde o schema pede 10 (e "true" onde pede true). Sem
+	// a conversão o Unmarshal falhava e a chamada sumia sem aviso.
+	for _, k := range []string{"start_line", "end_line", "job_id", "lines"} {
+		if v, ok := campos[k].(string); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				campos[k] = n
+			} else {
+				delete(campos, k)
+			}
+		}
+	}
+	if v, ok := campos["background"].(string); ok {
+		campos["background"] = strings.EqualFold(strings.TrimSpace(v), "true")
 	}
 
 	bruto, err := json.Marshal(campos)
@@ -3380,6 +3642,22 @@ func (m *Model) scrollPage(dir int) {
 		passo = 1
 	}
 	m.viewport.SetYOffset(m.viewport.YOffset + dir*passo)
+	if dir < 0 {
+		m.soltouFim = true
+	} else {
+		// Descer ate o fim devolve o acompanhamento.
+		m.soltouFim = !m.viewport.AtBottom()
+	}
+}
+
+// segue diz se a conversa deve acompanhar o fim.
+func (m *Model) segue() bool { return !m.soltouFim }
+
+// colaNoFim leva a conversa ao fim se voce nao rolou para cima.
+func (m *Model) colaNoFim() {
+	if m.segue() {
+		m.viewport.GotoBottom()
+	}
 }
 
 // limpaCampoDeTexto devolve o campo de digitação ao estado inicial.
@@ -3497,4 +3775,68 @@ func (m *Model) mudaWorkspace(caminho string, limpaConversa bool) error {
 		m.resetConversation()
 	}
 	return nil
+}
+
+// previaDoPedido mostra as primeiras linhas do que vai ser gravado, para a
+// confirmação não ser um "sim" às cegas.
+func previaDoPedido(texto, marca string, max int) string {
+	if strings.TrimSpace(texto) == "" {
+		return ""
+	}
+	linhas := strings.Split(strings.TrimRight(texto, "\n"), "\n")
+	var sb strings.Builder
+	for i, l := range linhas {
+		if i >= max {
+			sb.WriteString(fmt.Sprintf("\n      … +%d linhas", len(linhas)-max))
+			break
+		}
+		if len(l) > 100 {
+			l = l[:100] + "…"
+		}
+		sb.WriteString("\n      " + marca + " " + l)
+	}
+	return sb.String()
+}
+
+// chamadaJaFeita diz se uma leitura/listagem igual ja rodou: nesse caso nem a
+// linha "leu X" e repetida na tela.
+func (m *Model) chamadaJaFeita(c agents.ToolCall) bool {
+	nome := strings.ToLower(c.Function.Name)
+	if nome != "read_file" && nome != "list_dir" {
+		return false
+	}
+	if _, ok := c.Function.Arguments["start_line"]; ok {
+		return false
+	}
+	if _, ok := c.Function.Arguments["end_line"]; ok {
+		return false
+	}
+	caminho, _ := c.Function.Arguments["path"].(string)
+	if caminho == "" {
+		return false
+	}
+	_, feita := m.chamadasFeitas[nome+"\x00"+filepath.Clean(caminho)]
+	return feita
+}
+
+// avisaJobsConcluidos mostra na conversa os comandos de segundo plano que
+// terminaram desde a última checagem.
+func (m *Model) avisaJobsConcluidos() {
+	for _, j := range mcp.JobsConcluidos() {
+		icone, cor, estado := "✓", ghGreen, "terminou"
+		if j.ExitErr != "" {
+			icone, cor, estado = "✗", colAlarm, "falhou ("+j.ExitErr+")"
+		}
+		m.addMessage(renderNotice(icone, fmt.Sprintf("segundo plano #%d %s: %s  — peça ao modelo para ler com job_output", j.ID, estado, ansi.Truncate(j.Command, 60, "…")), cor))
+		m.addMessage("")
+	}
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, x := range v {
+		if strings.TrimSpace(x) != "" {
+			return x
+		}
+	}
+	return ""
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // Manager centraliza operações de arquivo dentro do workspace do agente.
@@ -78,7 +79,43 @@ func (m *Manager) ReadFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(absolute)
+	dados, err := os.ReadFile(absolute)
+	if err != nil {
+		return nil, explicaErroDeCaminho(path, absolute, err)
+	}
+	return dados, nil
+}
+
+// explicaErroDeCaminho troca o erro cru do sistema ("not a directory") por uma
+// explicação que o modelo consegue usar: o que existe de verdade perto do
+// caminho pedido. Sem isso ele repetia o mesmo caminho errado ciclo apos ciclo.
+func explicaErroDeCaminho(pedido, absoluto string, err error) error {
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		dir := filepath.Dir(absoluto)
+		for dir != "/" && dir != "." {
+			if info, e := os.Stat(dir); e == nil && info.IsDir() {
+				break
+			}
+			dir = filepath.Dir(dir)
+		}
+		var nomes []string
+		if ents, e := os.ReadDir(dir); e == nil {
+			for i, ent := range ents {
+				if i >= 40 {
+					nomes = append(nomes, "...")
+					break
+				}
+				n := ent.Name()
+				if ent.IsDir() {
+					n += "/"
+				}
+				nomes = append(nomes, n)
+			}
+		}
+		return fmt.Errorf("%q não existe (ou parte do caminho é um arquivo, não uma pasta). "+
+			"Conteúdo real de %s: %s", pedido, dir, strings.Join(nomes, ", "))
+	}
+	return err
 }
 
 // WriteFile cria/atualiza um arquivo garantindo diretórios intermediários.
@@ -133,7 +170,7 @@ func (m *Manager) List(path string) ([]fs.DirEntry, string, error) {
 
 	entries, err := os.ReadDir(absolute)
 	if err != nil {
-		return nil, "", fmt.Errorf("falha ao listar diretório: %w", err)
+		return nil, "", fmt.Errorf("falha ao listar diretório: %w", explicaErroDeCaminho(path, absolute, err))
 	}
 
 	return entries, absolute, nil

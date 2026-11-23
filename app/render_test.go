@@ -421,6 +421,7 @@ func TestNovaMensagemNaoPuxaQuemEstaLendo(t *testing.T) {
 	}
 
 	m.viewport.SetYOffset(5) // o usuário subiu para reler
+	m.soltouFim = true       // rolar de propósito solta o acompanhamento
 	m.addMessage("mensagem nova chegou")
 
 	if m.viewport.YOffset != 5 {
@@ -429,6 +430,7 @@ func TestNovaMensagemNaoPuxaQuemEstaLendo(t *testing.T) {
 
 	// Já no fim, a conversa continua acompanhando sozinha.
 	m.viewport.GotoBottom()
+	m.soltouFim = false // End devolve o acompanhamento
 	fim := m.viewport.YOffset
 	m.addMessage("outra mensagem")
 	if m.viewport.YOffset <= fim {
@@ -892,5 +894,37 @@ func TestComandoPastaRecomecaAConversa(t *testing.T) {
 	if len(m.conversationHistory) != 1 {
 		t.Errorf("o contexto do projeto anterior continuou: %d mensagens",
 			len(m.conversationHistory))
+	}
+}
+
+// A altura da area muda a cada quadro (previa do streaming). Isso nao pode
+// fazer a conversa parar de acompanhar o fim.
+func TestAcompanhaMesmoQuandoAAlturaMuda(t *testing.T) {
+	m := novoModelDeTeste(t)
+	m.viewport = viewport.New(40, 10)
+	for i := 0; i < 60; i++ {
+		m.addMessage(fmt.Sprintf("linha %d", i))
+	}
+	// A previa cresceu: a area encolhe e o AtBottom passa a dar falso.
+	m.viewport.Height = 6
+	if m.viewport.AtBottom() {
+		t.Skip("o viewport mudou; o cenario nao reproduz mais")
+	}
+	m.addMessage("resposta nova")
+	if !m.viewport.AtBottom() {
+		t.Fatal("deixou de acompanhar sem o usuario ter rolado")
+	}
+
+	// Depois de rolar de proposito, para de acompanhar; PgDn ate o fim volta.
+	m.scrollPage(-1)
+	m.addMessage("outra")
+	if m.viewport.AtBottom() {
+		t.Fatal("puxou o usuario que estava lendo")
+	}
+	for i := 0; i < 20; i++ {
+		m.scrollPage(1)
+	}
+	if m.soltouFim {
+		t.Fatal("chegar ao fim devia devolver o acompanhamento")
 	}
 }

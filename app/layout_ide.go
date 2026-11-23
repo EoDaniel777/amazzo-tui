@@ -110,6 +110,7 @@ func (m *Model) applyLayout() {
 	}
 	m.viewport.Width = vw
 	m.viewport.Height = vh
+	m.colaNoFim()
 	m.textarea.SetWidth(m.larguraDoCampo())
 	m.adjustTextareaHeight()
 	m.setGlamourWidth(vw - 4)

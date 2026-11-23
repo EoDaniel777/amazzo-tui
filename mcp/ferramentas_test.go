@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,5 +44,21 @@ func TestWriteFileDiferenciaCriadoDeSobrescrito(t *testing.T) {
 	r2 := s.writeFile(Request{Tool: "write_file", Path: "n.txt", Content: "y"}, false)
 	if !strings.Contains(r1.Content, "criado") || !strings.Contains(r2.Content, "sobrescrito") {
 		t.Fatalf("mensagens: %q | %q", r1.Content, r2.Content)
+	}
+}
+
+func TestReadFileIntervaloInvertidoNaoQuebra(t *testing.T) {
+	s := servidorTemp(t)
+	abs, _ := s.fs.Resolve("x.txt")
+	var sb strings.Builder
+	for i := 1; i <= 300; i++ {
+		sb.WriteString("linha\n")
+	}
+	if err := os.WriteFile(abs, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Handle(context.Background(), []Request{{Tool: "read_file", Path: "x.txt", StartLine: 259, EndLine: 120}})
+	if err != nil || r[0].Status != "success" || !strings.Contains(r[0].Content, "[linhas 120-259 de 301]") {
+		t.Fatalf("%+v %v", r, err)
 	}
 }

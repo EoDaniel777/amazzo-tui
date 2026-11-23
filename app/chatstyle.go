@@ -38,7 +38,7 @@ func (m *Model) addRerenderable(fn func() string) {
 // rerenderHistory redesenha as mensagens registradas, com as cores e a
 // largura atuais.
 func (m *Model) rerenderHistory() {
-	atBottom := m.viewport.AtBottom()
+	atBottom := m.segue()
 	for idx, it := range m.rerender {
 		if idx >= len(m.messages) || m.messages[idx] != it.last {
 			delete(m.rerender, idx)
@@ -121,6 +121,7 @@ func toolResultBlock(res mcp.Result, width int) string {
 		return txt
 	}
 
+	res.Content = limpaTexto(res.Content)
 	tool := strings.ToLower(res.Tool)
 	linhas := linhasUteis(res.Content)
 	primeira := ""
@@ -162,7 +163,15 @@ func toolResultBlock(res mcp.Result, width int) string {
 		}
 		return check(resumo) + "\n" + dim.Render("    "+strings.Join(limita(itens, 5), "\n    ")) + maisLinhas(len(itens), 5, dim)
 
-	case strings.Contains(tool, "exec"):
+	case strings.Contains(tool, "subagent"):
+		var itens []string
+		for _, l := range linhas {
+			itens = append(itens, xansi.Truncate(stripEmoji(l), max(20, width-10), "…"))
+		}
+		return check("subagente concluiu · "+dim.Render(xansi.Truncate(res.Path, max(20, width-40), "…"))) +
+			"\n" + dim.Render("    "+strings.Join(limita(itens, 4), "\n    ")) + maisLinhas(len(itens), 4, dim)
+
+	case strings.Contains(tool, "exec"), tool == "job_output":
 		if strings.HasPrefix(res.Content, "O comando continua rodando") {
 			return "  " + lipgloss.NewStyle().Foreground(colAct).Render("●") + " " + stripEmoji(strings.SplitN(res.Content, "\n", 2)[0])
 		}
@@ -171,13 +180,26 @@ func toolResultBlock(res mcp.Result, width int) string {
 		if len(saida) == 0 {
 			return check(resumo + dim.Render(" · sem saída"))
 		}
-		corpo := limitaFim(saida, 10)
+		// Mantém a indentação da saída; só descarta linhas vazias.
+		var brutas []string
+		for _, l := range strings.Split(res.Content, "\n") {
+			if strings.TrimSpace(l) != "" {
+				brutas = append(brutas, strings.TrimRight(l, " "))
+			}
+		}
+		corpo := cortaLinhas(limitaFim(brutas, 10), max(20, width-12))
+		if extra := len(brutas) - len(corpo); extra > 0 {
+			corpo = append([]string{fmt.Sprintf("… %d linhas acima", extra)}, corpo...)
+		}
 		box := lipgloss.NewStyle().BorderStyle(lipgloss.RoundedBorder()).BorderForeground(ghLine).
-			Foreground(colGraphite).Padding(0, 1).Render(xansi.Truncate(strings.Join(corpo, "\n"), max(20, width-8), "…"))
+			Foreground(colGraphite).Padding(0, 1).Render(strings.Join(corpo, "\n"))
 		return check(resumo) + "\n" + indenta(box, "    ")
 
 	case strings.Contains(tool, "fetch"):
 		return check(fmt.Sprintf("conteúdo web obtido · %d caracteres", len(res.Content)))
+
+	case res.Preview != "" && (strings.Contains(tool, "edit") || strings.Contains(tool, "write") || strings.Contains(tool, "append")):
+		return cartaoDeArquivo(res, width)
 
 	case strings.Contains(tool, "edit"), strings.Contains(tool, "write"), strings.Contains(tool, "append"),
 		strings.Contains(tool, "move"), strings.Contains(tool, "make"), strings.Contains(tool, "dir"):
@@ -277,3 +299,44 @@ func glamourStyleFromPalette() ansi.StyleConfig {
 }
 
 var _ = unicode.IsSpace
+
+// cartaoDeArquivo mostra o que aconteceu com o arquivo: o verbo, o caminho,
+// o tamanho e as linhas que entraram (+) e saíram (-). Quem pede para criar ou
+// editar precisa ver o resultado, não só um "ok".
+func cartaoDeArquivo(res mcp.Result, width int) string {
+	ok := lipgloss.NewStyle().Foreground(ghGreen)
+	dim := lipgloss.NewStyle().Foreground(colGraphite)
+	add := lipgloss.NewStyle().Foreground(ghGreen)
+	del := lipgloss.NewStyle().Foreground(colAlarm)
+
+	verbo := "editou"
+	c := strings.ToLower(res.Content)
+	switch {
+	case strings.Contains(c, " criado "):
+		verbo = "criou"
+	case strings.Contains(c, "sobrescrito"):
+		verbo = "sobrescreveu"
+	case strings.Contains(c, "acrescentado"):
+		verbo = "acrescentou em"
+	}
+
+	cab := "  " + ok.Render("✓") + " " + verbo + " " + res.Path
+	if res.Lines > 0 {
+		cab += "  " + dim.Render(fmt.Sprintf("%d linhas · %s", res.Lines, bytesFmt(res.Bytes)))
+	}
+
+	larg := max(20, width-10)
+	var linhas []string
+	for _, l := range strings.Split(res.Preview, "\n") {
+		l = xansi.Truncate(strings.ReplaceAll(l, "\t", "    "), larg, "…")
+		switch {
+		case strings.HasPrefix(l, "+"):
+			linhas = append(linhas, add.Render(l))
+		case strings.HasPrefix(l, "-"):
+			linhas = append(linhas, del.Render(l))
+		default:
+			linhas = append(linhas, dim.Render(l))
+		}
+	}
+	return cab + "\n" + indenta(strings.Join(linhas, "\n"), "    ")
+}
